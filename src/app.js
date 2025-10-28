@@ -1,10 +1,15 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
 const pool = require("./db");
+const authRoutes = require("./routes/authRoutes");
+const { verifyToken, authorizeRoles } = require("./middleware/authMiddleware");
 const { encrypt, decrypt } = require("./encryptionService");
+
 
 const app = express();
 app.use(express.json());
+app.use("/api/auth", authRoutes);
+
 
 // 📩 Crear usuario y guardar en ambas tablas
 app.post("/api/usuarios", async (req, res) => {
@@ -64,6 +69,10 @@ app.get("/api/usuarios", async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Error al obtener usuarios." });
   }
+});
+
+app.get("/api/admin", verifyToken, authorizeRoles("Admin"), (req, res) => {
+  res.json({ message: "Bienvenido, Admin!" });
 });
 
 const PORT = 3000;
