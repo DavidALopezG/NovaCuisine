@@ -1,0 +1,99 @@
+-- DDL (Data Definition Language) - Creación de Tablas
+
+-- 1. ROLES (Para permisos de seguridad)
+CREATE TABLE ROLES (
+    rol_id SERIAL PRIMARY KEY,
+    nombre_rol VARCHAR(50) UNIQUE NOT NULL -- 'Administrador', 'Docente', 'Bodega'
+);
+
+-- 2. USUARIOS (Para autenticación)
+CREATE TABLE USUARIOS (
+    usuario_id SERIAL PRIMARY KEY,
+    nombre_completo VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    contrasena_hash VARCHAR(255) NOT NULL, -- Almacenar siempre hashes, nunca contraseñas en texto plano
+    rol_id INTEGER NOT NULL REFERENCES ROLES(rol_id),
+    activo BOOLEAN DEFAULT TRUE
+);
+
+-- 3. TITULACIONES (Ej. Pastelería, Cocina Internacional)
+CREATE TABLE TITULACIONES (
+    titulacion_id SERIAL PRIMARY KEY,
+    nombre_titulacion VARCHAR(100) UNIQUE NOT NULL
+);
+
+-- 4. ESTUDIANTES (Datos de la cartera de clientes)
+CREATE TABLE ESTUDIANTES (
+    estudiante_id SERIAL PRIMARY KEY,
+    codigo_estudiante VARCHAR(20) UNIQUE NOT NULL,
+    nombre VARCHAR(50) NOT NULL,
+    apellido VARCHAR(50) NOT NULL,
+    email VARCHAR(100),
+    titulacion_id INTEGER REFERENCES TITULACIONES(titulacion_id)
+);
+
+-- 5. COBROS_OBLIGACIONES (Registro de las cuotas mensuales a pagar)
+CREATE TABLE COBROS_OBLIGACIONES (
+    obligacion_id SERIAL PRIMARY KEY,
+    estudiante_id INTEGER NOT NULL REFERENCES ESTUDIANTES(estudiante_id),
+    fecha_vencimiento DATE NOT NULL,
+    monto_total NUMERIC(10, 2) NOT NULL,
+    monto_pagado NUMERIC(10, 2) DEFAULT 0.00,
+    estado VARCHAR(20) NOT NULL, -- 'PENDIENTE', 'PAGADO', 'VENCIDO'
+    fecha_pago DATE -- Se llena al registrar el pago
+);
+
+-- 6. ASIGNATURAS (Para filtrar recetas académicamente)
+CREATE TABLE ASIGNATURAS (
+    asignatura_id SERIAL PRIMARY KEY,
+    nombre_asignatura VARCHAR(100) UNIQUE NOT NULL
+);
+
+-- 7. RECETAS (Ficha maestra de la receta)
+CREATE TABLE RECETAS (
+    receta_id SERIAL PRIMARY KEY,
+    nombre VARCHAR(150) NOT NULL,
+    porciones INTEGER NOT NULL,
+    tiempo_prep_min INTEGER,
+    asignatura_id INTEGER REFERENCES ASIGNATURAS(asignatura_id),
+    usuario_creador_id INTEGER REFERENCES USUARIOS(usuario_id),
+    fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 8. RECETAS_VERSIONES (Para trazabilidad y control de cambios)
+CREATE TABLE RECETAS_VERSIONES (
+    version_id SERIAL PRIMARY KEY,
+    receta_id INTEGER NOT NULL REFERENCES RECETAS(receta_id),
+    numero_version VARCHAR(10) NOT NULL, -- Ej: '1.0', '1.1'
+    contenido_json TEXT, -- Almacena la descripción, pasos, y estructura de la receta
+    costo_unitario NUMERIC(10, 2) DEFAULT 0.00, -- Calculado automáticamente
+    precio_venta_sugerido NUMERIC(10, 2) DEFAULT 0.00,
+    estado VARCHAR(20) DEFAULT 'BORRADOR', -- 'BORRADOR', 'APROBADA'
+    fecha_version TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (receta_id, numero_version)
+);
+
+-- 9. INVENTARIO_ARTICULOS (Utensilios y Maquinaria, no Ingredientes)
+CREATE TABLE INVENTARIO_ARTICULOS (
+    articulo_id SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    tipo VARCHAR(50) NOT NULL, -- 'Utensilio', 'Maquinaria'
+    stock_actual INTEGER DEFAULT 0,
+    ubicacion VARCHAR(50)
+);
+
+-- 10. RECETA_ARTICULOS_MENAJE (Reemplazo de 'Ficha de Menaje')
+CREATE TABLE RECETA_ARTICULOS_MENAJE (
+    version_id INTEGER NOT NULL REFERENCES RECETAS_VERSIONES(version_id),
+    articulo_id INTEGER NOT NULL REFERENCES INVENTARIO_ARTICULOS(articulo_id),
+    cantidad_requerida INTEGER NOT NULL,
+    PRIMARY KEY (version_id, articulo_id)
+);
+
+-- 11. INSUMOS_COSTOS (Para el cálculo automático de costos de la receta)
+CREATE TABLE INSUMOS_COSTOS (
+    insumo_id SERIAL PRIMARY KEY,
+    nombre_insumo VARCHAR(100) UNIQUE NOT NULL,
+    costo_unitario NUMERIC(10, 4) NOT NULL,
+    unidad_medida VARCHAR(20) NOT NULL -- Ej: 'gramos', 'ml', 'unidad'
+);
