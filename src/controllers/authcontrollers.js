@@ -3,24 +3,8 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
-const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_SECRET = "clave-super-segura"; // 🔒 cámbiala por una variable de entorno
 
-// Registro de usuario
-async function register(req, res) {
-  const { nombre, email, contrasena, rol } = req.body;
-  try {
-    const hashedPassword = await bcrypt.hash(contrasena, 10);
-    await pool.query(
-      `INSERT INTO usuarios (nombre, email, contrasena, rol)
-       VALUES ($1, $2, $3, $4)`,
-      [nombre, email, hashedPassword, rol]
-    );
-    res.status(201).json({ message: "Usuario registrado correctamente." });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Error al registrar usuario." });
-  }
-}
 
 // Inicio de sesión
 async function login(req, res) {
@@ -50,4 +34,4 @@ async function login(req, res) {
   }
 }
 
-module.exports = { register, login };
+module.exports = { login };

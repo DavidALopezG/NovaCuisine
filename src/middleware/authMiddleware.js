@@ -1,4 +1,5 @@
 const jwt = require("jsonwebtoken");
+require("dotenv").config();
 const JWT_SECRET = "clave-super-segura";
 
 function verifyToken(req, res, next) {
