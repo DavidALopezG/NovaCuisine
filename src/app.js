@@ -2,12 +2,15 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const pool = require("./db");
 const authRoutes = require("./routes/authRoutes");
+const cobrosRoutes = require("./routes/cobrosRoutes");
 const { verifyToken, authorizeRoles } = require("./middleware/authMiddleware");
 const { encrypt, decrypt } = require("./encryptionService");
 const app = express();
 app.use(express.json());
+const cors = require("cors");
+app.use(cors());
 app.use("/api/auth", authRoutes);
-
+app.use("/api/cobros", cobrosRoutes);
 
 // 📩 Crear usuario y guardar en ambas tablas
 app.post("/api/usuarios", async (req, res) => {
@@ -21,7 +24,7 @@ app.post("/api/usuarios", async (req, res) => {
     const result = await pool.query(
       `INSERT INTO usuarios (usuario_id, nombre_completo, email, contrasena_hash, rol_id, activo)
        VALUES ($1, $2, $3, $4, $5,$6) RETURNING usuario_id`,
-      [usuario_id, nombre_completo, email, encrypt(contrasena), rol_id, activo]
+      [usuario_id, nombre_completo, email, contrasenaHash, rol_id, activo]
     );
 
 
@@ -69,7 +72,7 @@ app.get("/api/usuarios", async (req, res) => {
   }
 });
 
-app.get("/api/admin", verifyToken, authorizeRoles("Admin"), (req, res) => {
+app.get("/api/admin", verifyToken, authorizeRoles("Admininstrador"), (req, res) => {
   res.json({ message: "Bienvenido, Admin!" });
 });
 
