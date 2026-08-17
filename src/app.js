@@ -14,6 +14,11 @@ app.use("/api/auth", authRoutes);
 app.use("/api/cobros", cobrosRoutes);
 app.use("/api/estudiantes", require("./routes/estudiantesRoutes"));
 app.use("/api/usuarios", require("./routes/usuariosRoutes"));
+app.use("/api/recetas", require("./routes/recetasRoutes"));
+app.use("/api/asignaturas", require("./routes/asignaturasRoutes"));
+app.use("/api/insumos", require("./routes/insumosRoutes"));
+app.use("/api/horarios", require("./routes/horariosRoutes"));
+app.use("/api/titulaciones", require("./routes/titulacionesRoutes"));
 
 app.get("/api/admin", verifyToken, authorizeRoles("Admininstrador"), (req, res) => {
   res.json({ message: "Bienvenido, Admin!" });

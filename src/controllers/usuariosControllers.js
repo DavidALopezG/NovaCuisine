@@ -1,24 +1,66 @@
 const pool = require("../db");
+const bcrypt = require("bcrypt");
 
 // 1. Crear Usuario (solo Admin)
 async function crearUsuario(req, res) {
-    const { nombre_completo, email, contrasena_hash, rol_id, activo } = req.body;
+    const { usuario_id, nombre_completo, email, contrasena, rol_id, activo, titulacion_id } = req.body;
 
+    if (!usuario_id || !nombre_completo || !email || !contrasena || !rol_id) {
+        return res.status(400).json({
+            error: "usuario_id, nombre_completo, email, contrasena y rol_id son obligatorios."
+        });
+    }
+
+    const client = await pool.connect();
     try {
-        const result = await pool.query(
-            `INSERT INTO public.usuarios (nombre_completo, email, contrasena_hash, rol_id, activo)
-             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-            [nombre_completo, email, contrasena_hash, rol_id, activo ?? true]
+        await client.query("BEGIN");
+
+        const contrasenaHash = await bcrypt.hash(contrasena, 10);
+
+        const usuarioResult = await client.query(
+            `INSERT INTO public.usuarios (usuario_id, nombre_completo, email, contrasena_hash, rol_id, activo)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING usuario_id, nombre_completo, email, rol_id, activo`,
+            [usuario_id, nombre_completo, email, contrasenaHash, rol_id, activo ?? true]
         );
 
+        let mensajeExtra = "";
+
+        // Si el rol es Estudiante (3), se crea automáticamente su ficha en ESTUDIANTES
+        // (igual que en el autorregistro). La titulación por defecto se podrá elegir
+        // correctamente cuando construyamos el módulo de Titulaciones.
+        if (Number(rol_id) === 3) {
+            const partes = nombre_completo.trim().split(" ");
+            const nombre = partes[0];
+            const apellido = partes.slice(1).join(" ") || " ";
+            const codigoEstudiante = `EST-${Date.now().toString().slice(-5)}`;
+
+            await client.query(
+                `INSERT INTO public.estudiantes
+                    (estudiante_id, nombre, apellido, email, titulacion_id, fecha_ingreso, codigo_estudiante)
+                 VALUES ($1, $2, $3, $4, $5, NOW(), $6)`,
+                [usuario_id, nombre, apellido, email, titulacion_id || 1, codigoEstudiante]
+            );
+
+            mensajeExtra = ` Se generó también su ficha de estudiante (código ${codigoEstudiante}).`;
+        }
+
+        await client.query("COMMIT");
+
         res.status(201).json({
-            message: "Usuario creado exitosamente.",
-            usuario: result.rows[0]
+            message: "Usuario creado exitosamente." + mensajeExtra,
+            usuario: usuarioResult.rows[0]
         });
 
     } catch (error) {
+        await client.query("ROLLBACK");
+        if (error.code === "23505") {
+            return res.status(409).json({ error: "Ya existe un usuario con esa cédula/ID o ese email." });
+        }
         console.error("🔴 Error al crear usuario:", error);
         res.status(500).json({ error: "Error interno al crear el usuario." });
+    } finally {
+        client.release();
     }
 }
 
@@ -68,19 +110,37 @@ async function obtenerUsuarioPorId(req, res) {
 // 4. Actualizar Usuario
 async function actualizarUsuario(req, res) {
     const { id } = req.params;
-    const { nombre_completo, email, rol_id, activo } = req.body;
+    const { nombre_completo, email, rol_id, activo, contrasena } = req.body;
 
     try {
-        const result = await pool.query(
-            `UPDATE public.usuarios
-             SET nombre_completo = $1,
-                 email = $2,
-                 rol_id = $3,
-                 activo = $4
-             WHERE usuario_id = $5
-             RETURNING *`,
-            [nombre_completo, email, rol_id, activo, id]
-        );
+        let result;
+
+        if (contrasena && contrasena.trim() !== "") {
+            // Se incluyó una nueva contraseña: también se actualiza el hash
+            const contrasenaHash = await bcrypt.hash(contrasena, 10);
+            result = await pool.query(
+                `UPDATE public.usuarios
+                 SET nombre_completo = $1,
+                     email = $2,
+                     rol_id = $3,
+                     activo = $4,
+                     contrasena_hash = $5
+                 WHERE usuario_id = $6
+                 RETURNING usuario_id, nombre_completo, email, rol_id, activo`,
+                [nombre_completo, email, rol_id, activo, contrasenaHash, id]
+            );
+        } else {
+            result = await pool.query(
+                `UPDATE public.usuarios
+                 SET nombre_completo = $1,
+                     email = $2,
+                     rol_id = $3,
+                     activo = $4
+                 WHERE usuario_id = $5
+                 RETURNING usuario_id, nombre_completo, email, rol_id, activo`,
+                [nombre_completo, email, rol_id, activo, id]
+            );
+        }
 
         if (result.rows.length === 0)
             return res.status(404).json({ error: "Usuario no encontrado." });
