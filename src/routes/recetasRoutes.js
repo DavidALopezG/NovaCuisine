@@ -1,34 +1,30 @@
 // src/routes/recetasRoutes.js
 const express = require("express");
 const router = express.Router();
-const recetasController = require("../controllers/recetasControllers");
+const c = require("../controllers/recetasControllers");
 const { verifyToken, authorizeRoles } = require("../middleware/authMiddleware");
 
-// Admin (1) y Docente (2) gestionan el recetario maestro.
-// Estudiante (3) solo puede ver el detalle de sus recetas asignadas.
 const adminODocente = authorizeRoles(1, 2);
+const todos = authorizeRoles(1, 2, 3);
 
 router.use(verifyToken);
 
-// 🎓 Estudiante: recetas que se le han asignado
-router.get("/mis-recetas", authorizeRoles(3), recetasController.misRecetas);
+// ⚠️ RUTAS ESTÁTICAS PRIMERO — antes de cualquier /:id
+// Si se declaran después de /:id, Express las interpreta como un ID
+router.get("/mis-recetas", authorizeRoles(3), c.misRecetas);
+router.put("/versiones/:version_id/aprobar", adminODocente, c.aprobarVersion);
 
-// 📋 Recetario maestro (Docente/Admin)
-router.post("/", adminODocente, recetasController.crearReceta);
-router.get("/", adminODocente, recetasController.obtenerRecetas);
+// Recetario maestro (Docente/Admin)
+router.post("/", adminODocente, c.crearReceta);
+router.get("/", adminODocente, c.obtenerRecetas);
 
-// Detalle: Admin, Docente o Estudiante (este último solo si tiene acceso asignado,
-// validado dentro del controller)
-router.get("/:id", authorizeRoles(1, 2, 3), recetasController.obtenerRecetaPorId);
+// Detalle: todos los roles (el controller valida acceso del estudiante internamente)
+router.get("/:id", todos, c.obtenerRecetaPorId);
+router.put("/:id", adminODocente, c.actualizarReceta);
+router.delete("/:id", adminODocente, c.eliminarReceta);
 
-router.put("/:id", adminODocente, recetasController.actualizarReceta);
-router.delete("/:id", adminODocente, recetasController.eliminarReceta);
-
-// 🔁 Versionado de recetas
-router.post("/:id/versiones", adminODocente, recetasController.crearVersion);
-router.put("/versiones/:version_id/aprobar", adminODocente, recetasController.aprobarVersion);
-
-// 🔗 Asignación de recetas a estudiantes
-router.post("/:id/asignar", adminODocente, recetasController.asignarReceta);
+// Versionado y asignación
+router.post("/:id/versiones", adminODocente, c.crearVersion);
+router.post("/:id/asignar", adminODocente, c.asignarReceta);
 
 module.exports = router;
