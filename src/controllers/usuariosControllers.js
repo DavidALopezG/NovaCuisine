@@ -55,7 +55,10 @@ async function crearUsuario(req, res) {
     } catch (error) {
         await client.query("ROLLBACK");
         if (error.code === "23505") {
-            return res.status(409).json({ error: "Ya existe un usuario con esa cédula/ID o ese email." });
+            if (error.detail && error.detail.toLowerCase().includes("email")) {
+                return res.status(409).json({ error: "Ya existe un usuario con ese correo electrónico." });
+            }
+            return res.status(409).json({ error: "Ya existe un usuario registrado con esa cédula / ID." });
         }
         console.error("🔴 Error al crear usuario:", error);
         res.status(500).json({ error: "Error interno al crear el usuario." });

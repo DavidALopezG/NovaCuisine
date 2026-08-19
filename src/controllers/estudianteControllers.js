@@ -29,7 +29,10 @@ async function crearEstudiante(req, res) {
 
     } catch (error) {
         if (error.code === "23505") {
-            return res.status(409).json({ error: "Ya existe un estudiante con ese ID o cédula." });
+            if (error.detail && error.detail.toLowerCase().includes("email")) {
+                return res.status(409).json({ error: "Ya existe un estudiante con ese correo electrónico." });
+            }
+            return res.status(409).json({ error: "Ya existe un estudiante con esa cédula / ID." });
         }
         if (error.code === "23503") {
             return res.status(400).json({ error: "El usuario_id no existe en la tabla de usuarios." });

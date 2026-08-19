@@ -91,15 +91,18 @@ async function login(req, res) {
     res.json({
       message: "Inicio de sesión exitoso.",
       token,
+      nombre_completo: user.nombre_completo,
+      rol: user.rol_id,
       usuario: {
         id: user.usuario_id,
         nombre: user.nombre_completo,
-        email: user.email
+        email: user.email,
+        rol_id: user.rol_id
       }
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("🔴 Error en login:", error);
     res.status(500).json({ error: "Error en el login." });
   }
 }
