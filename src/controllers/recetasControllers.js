@@ -68,10 +68,16 @@ async function crearReceta(req, res) {
 
       if (Array.isArray(insumos)) {
         for (const item of insumos) {
+          // La columna "cantidad" es NUMERIC NOT NULL en receta_version_insumos
+          // (no existe columna es_al_gusto en la BD real). Un ingrediente marcado
+          // como "al gusto / c/n" (ej. canela, aceite para freír) se guarda como
+          // cantidad = 0: el trigger de costo lo trata como $0 de aporte, y el
+          // frontend interpreta cantidad === 0 como "al gusto" al mostrarlo.
+          const cantidadFinal = item.es_al_gusto ? 0 : item.cantidad;
           await client.query(
             `INSERT INTO public.receta_version_insumos (version_id, insumo_id, cantidad)
              VALUES ($1, $2, $3)`,
-            [version.version_id, item.insumo_id, item.cantidad]
+            [version.version_id, item.insumo_id, cantidadFinal]
           );
         }
       }
@@ -321,10 +327,16 @@ async function crearVersion(req, res) {
 
       if (Array.isArray(insumos)) {
         for (const item of insumos) {
+          // La columna "cantidad" es NUMERIC NOT NULL en receta_version_insumos
+          // (no existe columna es_al_gusto en la BD real). Un ingrediente marcado
+          // como "al gusto / c/n" (ej. canela, aceite para freír) se guarda como
+          // cantidad = 0: el trigger de costo lo trata como $0 de aporte, y el
+          // frontend interpreta cantidad === 0 como "al gusto" al mostrarlo.
+          const cantidadFinal = item.es_al_gusto ? 0 : item.cantidad;
           await client.query(
             `INSERT INTO public.receta_version_insumos (version_id, insumo_id, cantidad)
              VALUES ($1, $2, $3)`,
-            [version.version_id, item.insumo_id, item.cantidad]
+            [version.version_id, item.insumo_id, cantidadFinal]
           );
         }
       }
