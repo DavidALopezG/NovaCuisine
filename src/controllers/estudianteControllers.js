@@ -2,15 +2,24 @@ const pool = require("../db");
 
 // 1. Crear Estudiante
 async function crearEstudiante(req, res) {
-    const { codigo_estudiante, nombre, apellido, email, titulacion_id } = req.body;
+    const { usuario_id, codigo_estudiante, nombre, apellido, email, titulacion_id } = req.body;
+
+    // usuario_id es obligatorio: todo estudiante debe estar vinculado a un usuario
+    if (!usuario_id || !nombre || !apellido || !email) {
+        return res.status(400).json({
+            error: "usuario_id, nombre, apellido y email son obligatorios. Usa el módulo de Usuarios para crear estudiantes."
+        });
+    }
 
     try {
+        const codigo = codigo_estudiante || `EST-${Date.now().toString().slice(-5)}`;
+
         const result = await pool.query(
             `INSERT INTO public.estudiantes
-            (codigo_estudiante, nombre, apellido, email, titulacion_id)
-             VALUES ($1, $2, $3, $4, $5)
+            (estudiante_id, codigo_estudiante, nombre, apellido, email, titulacion_id, fecha_ingreso)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())
              RETURNING *`,
-            [codigo_estudiante, nombre, apellido, email, titulacion_id]
+            [usuario_id, codigo, nombre, apellido, email, titulacion_id || 1]
         );
 
         res.status(201).json({
@@ -19,6 +28,12 @@ async function crearEstudiante(req, res) {
         });
 
     } catch (error) {
+        if (error.code === "23505") {
+            return res.status(409).json({ error: "Ya existe un estudiante con ese ID o cédula." });
+        }
+        if (error.code === "23503") {
+            return res.status(400).json({ error: "El usuario_id no existe en la tabla de usuarios." });
+        }
         console.error("🔴 Error al crear estudiante:", error);
         res.status(500).json({ error: "Error interno al crear estudiante." });
     }
@@ -103,6 +118,24 @@ async function eliminarEstudiante(req, res) {
     const { id } = req.params;
 
     try {
+        // Verificar dependencias antes de eliminar
+        const cobros = await pool.query(
+            `SELECT COUNT(*) FROM public.cobros_obligaciones WHERE estudiante_id = $1`, [id]
+        );
+        const recetas = await pool.query(
+            `SELECT COUNT(*) FROM public.estudiante_receta_acceso WHERE estudiante_id = $1`, [id]
+        );
+
+        const totalCobros  = parseInt(cobros.rows[0].count);
+        const totalRecetas = parseInt(recetas.rows[0].count);
+
+        if (totalCobros > 0 || totalRecetas > 0) {
+            return res.status(409).json({
+                error: `No se puede eliminar: el estudiante tiene ${totalCobros} cobro(s) y ${totalRecetas} receta(s) asignada(s). Desactiva su cuenta en lugar de eliminarla.`
+            });
+        }
+
+        // Sin dependencias: proceder con el borrado
         const result = await pool.query(
             `DELETE FROM public.estudiantes WHERE estudiante_id = $1 RETURNING *`,
             [id]
@@ -111,8 +144,13 @@ async function eliminarEstudiante(req, res) {
         if (result.rows.length === 0)
             return res.status(404).json({ error: "Estudiante no encontrado." });
 
+        // También desactivar el usuario vinculado
+        await pool.query(
+            `UPDATE public.usuarios SET activo = false WHERE usuario_id = $1`, [id]
+        );
+
         res.json({
-            message: "Estudiante eliminado.",
+            message: "Estudiante eliminado y usuario desactivado.",
             estudiante: result.rows[0]
         });
 

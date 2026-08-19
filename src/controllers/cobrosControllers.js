@@ -1,121 +1,136 @@
-// backend/controllers/cobros.controllers.js
+// src/controllers/cobrosControllers.js
 const pool = require("../db");
 const XLSX = require("xlsx");
 
-// Función auxiliar para calcular la fecha de vencimiento (3 meses a partir de hoy)
+// Fecha de vencimiento por defecto: 3 meses a partir de hoy
 const calcularFechaVencimiento = () => {
-    const today = new Date();
-    // Suma 3 meses a la fecha actual
-    today.setMonth(today.getMonth() + 3); 
-    // PostgreSQL acepta objetos Date directamente
-    return today; 
+    const d = new Date();
+    d.setMonth(d.getMonth() + 3);
+    return d;
 };
 
-// 1. POST: Crear una Nueva Obligación (CREATE)
+/* ═══════════════════════════════════════════════════════════
+   1. POST /api/cobros/obligaciones  (Admin)
+   ═══════════════════════════════════════════════════════════ */
 async function crearObligacion(req, res) {
-    // Solo el Administrador debe poder crear obligaciones
-    const { estudiante_id, monto_total } = req.body;
-    
-    // Valores por defecto
-    const monto_pagado = 0.00;
-    const estado = 'Pendiente'; 
-    const fecha_vencimiento = calcularFechaVencimiento();
-    // La fecha_pago se establece en NULL hasta que se registre un pago.
+    const { estudiante_id, monto_total, fecha_vencimiento } = req.body;
+
+    if (!estudiante_id || !monto_total) {
+        return res.status(400).json({ error: "estudiante_id y monto_total son obligatorios." });
+    }
 
     try {
+        const fecha = fecha_vencimiento
+            ? new Date(fecha_vencimiento)
+            : calcularFechaVencimiento();
+
         const result = await pool.query(
-            `INSERT INTO public.cobros_obligaciones (estudiante_id, fecha_vencimiento, monto_total, monto_pagado, estado)
-             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-            [estudiante_id, fecha_vencimiento, monto_total, monto_pagado, estado]
+            `INSERT INTO public.cobros_obligaciones
+                (estudiante_id, fecha_vencimiento, monto_total, monto_pagado, estado)
+             VALUES ($1, $2, $3, 0.00, 'PENDIENTE') RETURNING *`,
+            [estudiante_id, fecha, monto_total]
         );
-
-        res.status(201).json({ 
-            message: "Obligación creada con vencimiento a 3 meses.", 
-            obligacion: result.rows[0] 
+        res.status(201).json({
+            message: "Obligación creada correctamente.",
+            obligacion: result.rows[0]
         });
-
     } catch (error) {
-        console.error("🔴 Error al crear obligación:", error);
+        console.error("🔴 crearObligacion:", error);
         res.status(500).json({ error: "Error interno al crear la obligación." });
     }
 }
 
-
-// 2. GET: Obtener Todas las Obligaciones (READ All)
+/* ═══════════════════════════════════════════════════════════
+   2. GET /api/cobros/obligaciones  (Admin)
+   ═══════════════════════════════════════════════════════════ */
 async function obtenerObligaciones(req, res) {
     try {
         const result = await pool.query(
-            `SELECT * FROM public.cobros_obligaciones ORDER BY fecha_vencimiento ASC`
+            `SELECT co.*, e.nombre, e.apellido, e.codigo_estudiante
+             FROM public.cobros_obligaciones co
+             LEFT JOIN public.estudiantes e ON co.estudiante_id = e.estudiante_id
+             ORDER BY co.fecha_vencimiento ASC`
         );
         res.json(result.rows);
     } catch (error) {
-        console.error("🔴 Error al obtener obligaciones:", error);
+        console.error("🔴 obtenerObligaciones:", error);
         res.status(500).json({ error: "Error al obtener obligaciones." });
     }
 }
 
-// 3. PUT: Registrar Pago y Actualizar Obligación (UPDATE)
+/* ═══════════════════════════════════════════════════════════
+   3. PUT /api/cobros/pagar  (Admin)
+   FIX: usa client dedicado para que BEGIN/COMMIT sean en la
+   misma conexión y no en conexiones aleatorias del pool.
+   ═══════════════════════════════════════════════════════════ */
 async function registrarPago(req, res) {
-    // ⚠️ Esta función asume que solo se realiza un pago a la vez para una obligación.
     const { obligacion_id, monto_pago } = req.body;
-    const fecha_pago = new Date(); // Fecha del registro del pago
 
+    if (!obligacion_id || !monto_pago || isNaN(Number(monto_pago))) {
+        return res.status(400).json({ error: "obligacion_id y monto_pago son obligatorios." });
+    }
+
+    const client = await pool.connect(); // ← cliente dedicado (FIX)
     try {
-        // Inicia una transacción para asegurar atomicidad
-        await pool.query('BEGIN'); 
+        await client.query("BEGIN");
 
-        // 1. Obtener el estado actual de la obligación
-        const obligacionResult = await pool.query(
-            `SELECT monto_total, monto_pagado, estado FROM public.cobros_obligaciones WHERE obligacion_id = $1`,
+        const oblRes = await client.query(
+            `SELECT monto_total, monto_pagado, estado
+             FROM public.cobros_obligaciones
+             WHERE obligacion_id = $1 FOR UPDATE`,
             [obligacion_id]
         );
 
-        if (obligacionResult.rows.length === 0) {
-            await pool.query('ROLLBACK');
+        if (oblRes.rows.length === 0) {
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Obligación no encontrada." });
         }
-        
-        const obligacion = obligacionResult.rows[0];
-        const nuevoMontoPagado = parseFloat(obligacion.monto_pagado) + parseFloat(monto_pago);
-        const montoPendiente = parseFloat(obligacion.monto_total) - nuevoMontoPagado;
 
-        if (montoPendiente < 0) {
-            await pool.query('ROLLBACK');
+        const obl = oblRes.rows[0];
+
+        if (obl.estado === "PAGADO") {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ error: "Esta obligación ya está completamente pagada." });
+        }
+
+        const nuevoMontoPagado = parseFloat(obl.monto_pagado) + parseFloat(monto_pago);
+        const montoPendiente   = parseFloat(obl.monto_total) - nuevoMontoPagado;
+
+        if (montoPendiente < -0.01) {
+            await client.query("ROLLBACK");
             return res.status(400).json({ error: "El monto del pago excede la deuda restante." });
         }
 
-        const nuevoEstado = montoPendiente === 0 ? 'Pagado' : 'Parcial';
+        // FIX de estados: todos en MAYÚSCULAS para coincidir con VISTA_ESTADO_COBROS y CSS
+        const nuevoEstado = montoPendiente <= 0 ? "PAGADO" : "PARCIAL";
 
-        // 2. Actualizar la obligación con el nuevo monto, estado y fecha de pago.
-        const updateResult = await pool.query(
+        const updateRes = await client.query(
             `UPDATE public.cobros_obligaciones
-             SET monto_pagado = $1, 
+             SET monto_pagado = $1,
                  estado = $2,
-                 fecha_pago = $3
-             WHERE obligacion_id = $4 RETURNING *`,
-            [nuevoMontoPagado, nuevoEstado, fecha_pago, obligacion_id]
+                 fecha_pago = NOW()
+             WHERE obligacion_id = $3 RETURNING *`,
+            [nuevoMontoPagado, nuevoEstado, obligacion_id]
         );
 
-        // 3. Confirmar la transacción
-        await pool.query('COMMIT');
-        
-        // ✅ PRUEBAS DE ACEPTACIÓN: El administrador registra un pago y la BD refleja el cambio
-        res.json({
-            message: "Pago registrado y obligación actualizada.",
-            obligacion_actualizada: updateResult.rows[0],
-            estado_anterior: obligacion.estado
-        });
+        await client.query("COMMIT");
 
+        res.json({
+            message: "Pago registrado correctamente.",
+            obligacion: updateRes.rows[0]
+        });
     } catch (error) {
-        await pool.query('ROLLBACK'); // Revertir si algo falla
-        console.error("🔴 Error en la transacción de pago:", error);
-        res.status(500).json({ error: "Error interno al procesar el pago y la deuda." });
+        await client.query("ROLLBACK");
+        console.error("🔴 registrarPago:", error);
+        res.status(500).json({ error: "Error interno al registrar el pago." });
+    } finally {
+        client.release(); // ← siempre liberar el cliente
     }
 }
 
-// 4. POST: Importar Obligaciones masivamente desde un archivo Excel
-//    Columnas esperadas en la hoja (primera fila = encabezados):
-//    estudiante_id | monto_total | fecha_vencimiento (opcional, formato AAAA-MM-DD)
+/* ═══════════════════════════════════════════════════════════
+   4. POST /api/cobros/obligaciones/importar-excel  (Admin)
+   ═══════════════════════════════════════════════════════════ */
 async function importarObligacionesExcel(req, res) {
     if (!req.file) {
         return res.status(400).json({ error: "Debes adjuntar un archivo Excel (.xlsx o .xls)." });
@@ -124,10 +139,9 @@ async function importarObligacionesExcel(req, res) {
     let filas;
     try {
         const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-        const primeraHoja = workbook.SheetNames[0];
-        filas = XLSX.utils.sheet_to_json(workbook.Sheets[primeraHoja], { defval: null });
-    } catch (error) {
-        console.error("🔴 Error al leer el archivo Excel:", error);
+        const hoja = workbook.SheetNames[0];
+        filas = XLSX.utils.sheet_to_json(workbook.Sheets[hoja], { defval: null });
+    } catch {
         return res.status(400).json({ error: "No se pudo leer el archivo. Verifica que sea un Excel válido." });
     }
 
@@ -136,80 +150,133 @@ async function importarObligacionesExcel(req, res) {
     }
 
     const insertadas = [];
-    const errores = [];
-    const client = await pool.connect();
+    const errores    = [];
+    const client     = await pool.connect();
 
     try {
         await client.query("BEGIN");
 
         for (let i = 0; i < filas.length; i++) {
-            const fila = filas[i];
-            const numeroFila = i + 2; // +2 porque la fila 1 es el encabezado
+            const fila       = filas[i];
+            const numeroFila = i + 2;
 
-            // Normaliza nombres de columna (acepta mayúsculas/minúsculas y espacios)
             const claves = Object.keys(fila).reduce((acc, key) => {
-                acc[key.toString().trim().toLowerCase()] = fila[key];
+                acc[key.toString().trim().toLowerCase().replace(/ /g, "_")] = fila[key];
                 return acc;
             }, {});
 
-            const estudiante_id = claves["estudiante_id"];
-            const monto_total = claves["monto_total"];
-            const fecha_vencimiento_raw = claves["fecha_vencimiento"];
+            const estudiante_id       = claves["estudiante_id"];
+            const monto_total         = claves["monto_total"];
+            const fecha_vencimiento_r = claves["fecha_vencimiento"];
 
-            if (!estudiante_id || monto_total === null || monto_total === undefined || isNaN(Number(monto_total))) {
-                errores.push({ fila: numeroFila, motivo: "estudiante_id o monto_total faltante/ inválido." });
+            if (!estudiante_id || monto_total === null || isNaN(Number(monto_total))) {
+                errores.push({ fila: numeroFila, motivo: "estudiante_id o monto_total faltante/inválido." });
                 continue;
             }
 
-            const fecha_vencimiento = fecha_vencimiento_raw
-                ? new Date(fecha_vencimiento_raw)
+            const fecha = fecha_vencimiento_r
+                ? new Date(fecha_vencimiento_r)
                 : calcularFechaVencimiento();
 
             try {
-                const result = await client.query(
-                    `INSERT INTO public.cobros_obligaciones (estudiante_id, fecha_vencimiento, monto_total, monto_pagado, estado)
-                     VALUES ($1, $2, $3, 0.00, 'Pendiente') RETURNING *`,
-                    [String(estudiante_id), fecha_vencimiento, Number(monto_total)]
+                const r = await client.query(
+                    `INSERT INTO public.cobros_obligaciones
+                        (estudiante_id, fecha_vencimiento, monto_total, monto_pagado, estado)
+                     VALUES ($1, $2, $3, 0.00, 'PENDIENTE') RETURNING *`,
+                    [String(estudiante_id), fecha, Number(monto_total)]
                 );
-                insertadas.push(result.rows[0]);
-            } catch (errorFila) {
-                errores.push({ fila: numeroFila, motivo: errorFila.message });
+                insertadas.push(r.rows[0]);
+            } catch (e) {
+                errores.push({ fila: numeroFila, motivo: e.message });
             }
         }
 
         await client.query("COMMIT");
     } catch (error) {
         await client.query("ROLLBACK");
-        console.error("🔴 Error en la importación masiva:", error);
+        console.error("🔴 importarExcel:", error);
         return res.status(500).json({ error: "Error interno durante la importación." });
     } finally {
         client.release();
     }
 
     res.status(201).json({
-        message: `Importación finalizada: ${insertadas.length} obligaciones creadas, ${errores.length} filas con error.`,
+        message: `Importación completada: ${insertadas.length} registradas, ${errores.length} con error.`,
         total_filas: filas.length,
         insertadas,
         errores
     });
 }
 
-// 4. GET: Estado de cuenta del estudiante autenticado (usa la vista VISTA_ESTADO_COBROS)
+/* ═══════════════════════════════════════════════════════════
+   5. GET /api/cobros/mis-obligaciones  (Estudiante)
+   ═══════════════════════════════════════════════════════════ */
 async function obtenerMisObligaciones(req, res) {
     try {
-        const estudiante_id = req.user.id;
-
         const result = await pool.query(
-            `SELECT * FROM public.vista_estado_cobros
+            `SELECT
+                obligacion_id,
+                fecha_vencimiento,
+                monto_total,
+                monto_pagado,
+                (monto_total - monto_pagado) AS saldo_pendiente,
+                estado,
+                fecha_pago
+             FROM public.cobros_obligaciones
              WHERE estudiante_id = $1
              ORDER BY fecha_vencimiento ASC`,
-            [estudiante_id]
+            [req.user.id]
         );
-
         res.json(result.rows);
     } catch (error) {
-        console.error("🔴 Error al obtener el estado de cuenta del estudiante:", error);
+        console.error("🔴 obtenerMisObligaciones:", error);
         res.status(500).json({ error: "Error al obtener tu estado de cuenta." });
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   6. GET /api/cobros/resumen  (Admin — para Reportes)
+   ═══════════════════════════════════════════════════════════ */
+async function obtenerResumenFinanciero(req, res) {
+    try {
+        const result = await pool.query(`
+            SELECT
+                COALESCE(SUM(monto_pagado), 0)::numeric(10,2)                        AS total_recaudado,
+                COALESCE(SUM(monto_total - monto_pagado), 0)::numeric(10,2)           AS total_pendiente,
+                COUNT(*) FILTER (WHERE estado IN ('PENDIENTE','PARCIAL'))::int         AS obligaciones_pendientes,
+                COUNT(DISTINCT estudiante_id) FILTER (
+                    WHERE estado IN ('PENDIENTE','PARCIAL')
+                    AND   fecha_vencimiento < NOW()
+                )::int                                                                 AS estudiantes_morosos,
+                CASE
+                    WHEN SUM(monto_total) > 0
+                    THEN ROUND(SUM(monto_pagado) / SUM(monto_total) * 100, 1)
+                    ELSE 0
+                END                                                                    AS efectividad_cobro
+            FROM public.cobros_obligaciones
+        `);
+
+        const pagos = await pool.query(`
+            SELECT
+                co.obligacion_id,
+                co.fecha_pago,
+                co.monto_pagado AS monto,
+                e.nombre || ' ' || e.apellido AS estudiante,
+                e.codigo_estudiante
+            FROM public.cobros_obligaciones co
+            JOIN public.estudiantes e ON co.estudiante_id = e.estudiante_id
+            WHERE co.fecha_pago IS NOT NULL
+            ORDER BY co.fecha_pago DESC
+            LIMIT 10
+        `);
+
+        res.json({
+            resumen: result.rows[0],
+            pagosRecientes: pagos.rows
+        });
+    } catch (error) {
+        console.error("🔴 obtenerResumenFinanciero:", error);
+        res.status(500).json({ error: "Error al obtener el resumen financiero." });
     }
 }
 
@@ -218,6 +285,6 @@ module.exports = {
     obtenerObligaciones,
     registrarPago,
     importarObligacionesExcel,
-    obtenerMisObligaciones
-    // Aquí puedes añadir más funciones CRUD (e.g., obtener por estudiante, eliminar)
+    obtenerMisObligaciones,
+    obtenerResumenFinanciero
 };

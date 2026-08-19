@@ -3,7 +3,8 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { encrypt, decrypt } = require("../encryptionService");
 
-const JWT_SECRET = "clave-super-segura"; // cambiar por variable de entorno
+require("dotenv").config();
+const JWT_SECRET = process.env.JWT_SECRET || "clave-super-segura";
 
 // 📌 REGISTRO DE USUARIO
 async function register(req, res) {
@@ -51,6 +52,13 @@ async function register(req, res) {
 
   } catch (err) {
     console.error(err);
+    if (err.code === "23505") {
+      // Unique constraint violation: cédula o email ya registrado
+      if (err.detail && err.detail.includes("email")) {
+        return res.status(409).json({ error: "Ya existe una cuenta con ese correo electrónico." });
+      }
+      return res.status(409).json({ error: "Ya existe una cuenta registrada con esa cédula." });
+    }
     res.status(500).json({ error: "Error al crear el usuario/estudiante." });
   }
 }
