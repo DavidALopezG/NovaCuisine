@@ -4,7 +4,7 @@ const pool = require("../db");
 async function obtenerTitulaciones(req, res) {
     try {
         const result = await pool.query(
-            `SELECT titulacion_id, nombre_titulacion
+            `SELECT titulacion_id, nombre_titulacion, tipo, duracion_meses
              FROM public.titulaciones
              ORDER BY nombre_titulacion ASC`
         );
@@ -16,7 +16,7 @@ async function obtenerTitulaciones(req, res) {
 }
 
 async function crearTitulacion(req, res) {
-    const { nombre_titulacion } = req.body;
+    const { nombre_titulacion, tipo, duracion_meses } = req.body;
 
     if (!nombre_titulacion) {
         return res.status(400).json({ error: "nombre_titulacion es obligatorio." });
@@ -24,9 +24,9 @@ async function crearTitulacion(req, res) {
 
     try {
         const result = await pool.query(
-            `INSERT INTO public.titulaciones (nombre_titulacion)
-             VALUES ($1) RETURNING *`,
-            [nombre_titulacion]
+            `INSERT INTO public.titulaciones (nombre_titulacion, tipo, duracion_meses)
+             VALUES ($1, $2, $3) RETURNING *`,
+            [nombre_titulacion, tipo || null, duracion_meses || null]
         );
         res.status(201).json({ message: "Titulación creada.", titulacion: result.rows[0] });
     } catch (error) {
@@ -40,13 +40,16 @@ async function crearTitulacion(req, res) {
 
 async function actualizarTitulacion(req, res) {
     const { id } = req.params;
-    const { nombre_titulacion } = req.body;
+    const { nombre_titulacion, tipo, duracion_meses } = req.body;
 
     try {
         const result = await pool.query(
-            `UPDATE public.titulaciones SET nombre_titulacion = $1
-             WHERE titulacion_id = $2 RETURNING *`,
-            [nombre_titulacion, id]
+            `UPDATE public.titulaciones
+                SET nombre_titulacion = $1,
+                    tipo = $2,
+                    duracion_meses = $3
+              WHERE titulacion_id = $4 RETURNING *`,
+            [nombre_titulacion, tipo || null, duracion_meses || null, id]
         );
 
         if (result.rows.length === 0) {
