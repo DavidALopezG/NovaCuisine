@@ -48,9 +48,9 @@ async function obtenerHorarios(req, res) {
                     a.asignatura_id, a.nombre_asignatura, a.titulacion_id,
                     u.usuario_id AS docente_id, u.nombre_completo AS docente_nombre,
                     (
-                      SELECT COUNT(*)::int FROM public.estudiantes e
-                      WHERE e.titulacion_id = a.titulacion_id
-                    ) AS alumnos_estimados
+                      SELECT COUNT(*)::int FROM public.matriculas_horario m
+                      WHERE m.horario_id = h.horario_id
+                    ) AS alumnos_matriculados
              FROM public.horarios_clase h
              JOIN public.asignaturas a ON h.asignatura_id = a.asignatura_id
              LEFT JOIN public.usuarios u ON h.docente_id = u.usuario_id
@@ -158,37 +158,26 @@ async function actualizarHorario(req, res) {
 
 /* ============================================================
    4. GET /api/horarios/mi-horario  (Estudiante)
-   Devuelve el horario real según las asignaturas de SU titulación
+   Devuelve el horario real según la MATRÍCULA del estudiante
+   (antes se calculaba por titulación; ahora es matrícula explícita
+   por grupo/horario, así distintas secciones de la misma asignatura
+   no se mezclan entre sí).
    ============================================================ */
 async function obtenerMiHorario(req, res) {
     try {
         const estudiante_id = req.user.id;
 
-        const tituResult = await pool.query(
-            `SELECT titulacion_id FROM public.estudiantes WHERE estudiante_id = $1`,
-            [estudiante_id]
-        );
-
-        if (tituResult.rows.length === 0) {
-            return res.status(404).json({ error: "No se encontró tu información de estudiante." });
-        }
-
-        const titulacion_id = tituResult.rows[0].titulacion_id;
-
-        if (!titulacion_id) {
-            return res.json([]); // El estudiante no tiene titulación asignada aún
-        }
-
         const result = await pool.query(
             `SELECT h.horario_id, h.dia_semana, h.hora_inicio, h.hora_fin, h.aula,
                     a.nombre_asignatura,
                     u.nombre_completo AS docente_nombre
-             FROM public.horarios_clase h
+             FROM public.matriculas_horario m
+             JOIN public.horarios_clase h ON m.horario_id = h.horario_id
              JOIN public.asignaturas a ON h.asignatura_id = a.asignatura_id
              LEFT JOIN public.usuarios u ON h.docente_id = u.usuario_id
-             WHERE a.titulacion_id = $1
+             WHERE m.estudiante_id = $1
              ORDER BY h.hora_inicio, h.dia_semana`,
-            [titulacion_id]
+            [estudiante_id]
         );
 
         res.json(result.rows);
@@ -198,10 +187,130 @@ async function obtenerMiHorario(req, res) {
     }
 }
 
+/* ============================================================
+   5. GET /api/horarios/:id/estudiantes  (Admin/Docente)
+   Lista los estudiantes matriculados en un bloque de horario/grupo
+   ============================================================ */
+async function obtenerEstudiantesDeHorario(req, res) {
+    const { id } = req.params;
+
+    try {
+        const horario = await pool.query(
+            `SELECT docente_id FROM public.horarios_clase WHERE horario_id = $1`,
+            [id]
+        );
+        if (horario.rows.length === 0) {
+            return res.status(404).json({ error: "Horario no encontrado." });
+        }
+        if (req.user.rol === 2 && Number(horario.rows[0].docente_id) !== Number(req.user.id)) {
+            return res.status(403).json({ error: "No puedes ver la matrícula de un grupo que no te pertenece." });
+        }
+
+        const result = await pool.query(
+            `SELECT m.matricula_id, e.estudiante_id, e.codigo_estudiante, e.nombre, e.apellido, m.fecha_matricula
+             FROM public.matriculas_horario m
+             JOIN public.estudiantes e ON m.estudiante_id = e.estudiante_id
+             WHERE m.horario_id = $1
+             ORDER BY e.apellido, e.nombre`,
+            [id]
+        );
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error("🔴 Error al obtener estudiantes del horario:", error);
+        res.status(500).json({ error: "Error al obtener los estudiantes matriculados." });
+    }
+}
+
+/* ============================================================
+   6. POST /api/horarios/:id/estudiantes  (Admin/Docente)
+   Matricula un estudiante en un bloque de horario/grupo
+   ============================================================ */
+async function matricularEstudiante(req, res) {
+    const { id } = req.params;
+    const { estudiante_id } = req.body;
+
+    if (!estudiante_id) {
+        return res.status(400).json({ error: "estudiante_id es obligatorio." });
+    }
+
+    try {
+        const horario = await pool.query(
+            `SELECT docente_id FROM public.horarios_clase WHERE horario_id = $1`,
+            [id]
+        );
+        if (horario.rows.length === 0) {
+            return res.status(404).json({ error: "Horario no encontrado." });
+        }
+        if (req.user.rol === 2 && Number(horario.rows[0].docente_id) !== Number(req.user.id)) {
+            return res.status(403).json({ error: "No puedes matricular estudiantes en un grupo que no te pertenece." });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO public.matriculas_horario (horario_id, estudiante_id)
+             VALUES ($1, $2)
+             ON CONFLICT (horario_id, estudiante_id) DO NOTHING
+             RETURNING *`,
+            [id, estudiante_id]
+        );
+
+        res.status(201).json({
+            message: result.rows.length > 0
+                ? "Estudiante matriculado correctamente."
+                : "El estudiante ya estaba matriculado en este grupo.",
+            matricula: result.rows[0] || null
+        });
+    } catch (error) {
+        if (error.code === "23503") {
+            return res.status(400).json({ error: "El horario o el estudiante no existen." });
+        }
+        console.error("🔴 Error al matricular estudiante:", error);
+        res.status(500).json({ error: "Error interno al matricular al estudiante." });
+    }
+}
+
+/* ============================================================
+   7. DELETE /api/horarios/:id/estudiantes/:estudiante_id  (Admin/Docente)
+   Retira a un estudiante de un bloque de horario/grupo
+   ============================================================ */
+async function retirarEstudiante(req, res) {
+    const { id, estudiante_id } = req.params;
+
+    try {
+        const horario = await pool.query(
+            `SELECT docente_id FROM public.horarios_clase WHERE horario_id = $1`,
+            [id]
+        );
+        if (horario.rows.length === 0) {
+            return res.status(404).json({ error: "Horario no encontrado." });
+        }
+        if (req.user.rol === 2 && Number(horario.rows[0].docente_id) !== Number(req.user.id)) {
+            return res.status(403).json({ error: "No puedes retirar estudiantes de un grupo que no te pertenece." });
+        }
+
+        const result = await pool.query(
+            `DELETE FROM public.matriculas_horario WHERE horario_id = $1 AND estudiante_id = $2 RETURNING *`,
+            [id, estudiante_id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "El estudiante no estaba matriculado en este grupo." });
+        }
+
+        res.json({ message: "Estudiante retirado del grupo.", matricula: result.rows[0] });
+    } catch (error) {
+        console.error("🔴 Error al retirar estudiante:", error);
+        res.status(500).json({ error: "Error interno al retirar al estudiante." });
+    }
+}
+
 module.exports = {
     crearHorario,
     obtenerHorarios,
     actualizarHorario,
     eliminarHorario,
-    obtenerMiHorario
+    obtenerMiHorario,
+    obtenerEstudiantesDeHorario,
+    matricularEstudiante,
+    retirarEstudiante
 };

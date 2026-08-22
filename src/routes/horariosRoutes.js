@@ -18,4 +18,9 @@ router.get("/", adminODocente, horariosController.obtenerHorarios);
 router.put("/:id", adminODocente, horariosController.actualizarHorario);
 router.delete("/:id", adminODocente, horariosController.eliminarHorario);
 
+// 👥 Admin/Docente: matrícula de estudiantes por grupo/horario
+router.get("/:id/estudiantes", adminODocente, horariosController.obtenerEstudiantesDeHorario);
+router.post("/:id/estudiantes", adminODocente, horariosController.matricularEstudiante);
+router.delete("/:id/estudiantes/:estudiante_id", adminODocente, horariosController.retirarEstudiante);
+
 module.exports = router;
