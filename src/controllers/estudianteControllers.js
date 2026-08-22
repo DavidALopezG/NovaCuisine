@@ -47,9 +47,14 @@ async function crearEstudiante(req, res) {
 async function obtenerEstudiantes(req, res) {
     try {
         const result = await pool.query(
-            `SELECT estudiante_id, codigo_estudiante, nombre, apellido, email, titulacion_id
-             FROM public.estudiantes
-             ORDER BY estudiante_id ASC`
+            `SELECT e.estudiante_id, e.codigo_estudiante, e.nombre, e.apellido, e.email, e.titulacion_id,
+                    COALESCE((
+                        SELECT SUM(co.monto_total - co.monto_pagado)
+                        FROM public.cobros_obligaciones co
+                        WHERE co.estudiante_id = e.estudiante_id
+                    ), 0) AS saldo_pendiente
+             FROM public.estudiantes e
+             ORDER BY e.estudiante_id ASC`
         );
 
         res.json(result.rows);
@@ -224,13 +229,18 @@ async function obtenerMiPerfil(req, res) {
 
 
 // 7. Detalle de un estudiante para el expediente del Administrador
-//    (incluye las recetas que tiene asignadas)
+//    (incluye las recetas que tiene asignadas y su saldo pendiente real)
 async function obtenerDetalleEstudiante(req, res) {
     const { id } = req.params;
 
     try {
         const estudianteResult = await pool.query(
-            `SELECT e.*, t.nombre_titulacion
+            `SELECT e.*, t.nombre_titulacion,
+                    COALESCE((
+                        SELECT SUM(co.monto_total - co.monto_pagado)
+                        FROM public.cobros_obligaciones co
+                        WHERE co.estudiante_id = e.estudiante_id
+                    ), 0) AS saldo_pendiente
              FROM public.estudiantes e
              LEFT JOIN public.titulaciones t ON e.titulacion_id = t.titulacion_id
              WHERE e.estudiante_id = $1`,

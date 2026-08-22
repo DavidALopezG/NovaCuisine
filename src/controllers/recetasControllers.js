@@ -186,7 +186,21 @@ async function obtenerRecetaPorId(req, res) {
        ORDER BY version_id DESC`,
       [id]
     );
-    const versiones = versionesResult.rows;
+    // Defensa: si la columna contenido_json quedó guardada como texto plano
+    // (en vez de tipo json/jsonb reconocido por el driver), se parsea aquí
+    // para que el frontend siempre reciba un objeto { pasos: [...] } y no
+    // un string en el que "pasos" no existe.
+    const versiones = versionesResult.rows.map((v) => {
+      if (typeof v.contenido_json === "string") {
+        try {
+          v.contenido_json = JSON.parse(v.contenido_json);
+        } catch (e) {
+          console.error("🔴 contenido_json no es JSON válido para version_id", v.version_id, e);
+          v.contenido_json = null;
+        }
+      }
+      return v;
+    });
     const ultimaVersion = versiones[0] || null;
 
     let insumos = [];

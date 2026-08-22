@@ -77,6 +77,10 @@ async function login(req, res) {
 
     const user = result.rows[0];
 
+    if (user.activo === false) {
+      return res.status(403).json({ error: "Esta cuenta está desactivada. Contacta al administrador." });
+    }
+
     const isMatch = await bcrypt.compare(contrasena, user.contrasena_hash);
     if (!isMatch) {
       return res.status(401).json({ error: "Contraseña incorrecta." });
