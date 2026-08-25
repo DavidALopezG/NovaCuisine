@@ -19,6 +19,10 @@ async function crearObligacion(req, res) {
         return res.status(400).json({ error: "estudiante_id y monto_total son obligatorios." });
     }
 
+    if (isNaN(monto_total) || Number(monto_total) <= 0) {
+        return res.status(400).json({ error: "monto_total debe ser un número mayor a 0." });
+    }
+
     try {
         const fecha = fecha_vencimiento
             ? new Date(fecha_vencimiento)
@@ -66,8 +70,8 @@ async function obtenerObligaciones(req, res) {
 async function registrarPago(req, res) {
     const { obligacion_id, monto_pago } = req.body;
 
-    if (!obligacion_id || !monto_pago || isNaN(Number(monto_pago))) {
-        return res.status(400).json({ error: "obligacion_id y monto_pago son obligatorios." });
+    if (!obligacion_id || !monto_pago || isNaN(Number(monto_pago)) || Number(monto_pago) <= 0) {
+        return res.status(400).json({ error: "obligacion_id y monto_pago (mayor a 0) son obligatorios." });
     }
 
     const client = await pool.connect(); // ← cliente dedicado (FIX)

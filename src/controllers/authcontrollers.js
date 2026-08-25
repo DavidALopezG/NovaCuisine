@@ -2,9 +2,10 @@ const pool = require("../db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { encrypt, decrypt } = require("../encryptionService");
+const { requireEnv } = require("../config/env");
 
 require("dotenv").config();
-const JWT_SECRET = process.env.JWT_SECRET || "clave-super-segura";
+const JWT_SECRET = requireEnv("JWT_SECRET"); // antes tenía un valor hardcodeado aquí
 
 // 📌 REGISTRO DE USUARIO
 async function register(req, res) {
@@ -76,10 +77,6 @@ async function login(req, res) {
     }
 
     const user = result.rows[0];
-
-    if (user.activo === false) {
-      return res.status(403).json({ error: "Esta cuenta está desactivada. Contacta al administrador." });
-    }
 
     const isMatch = await bcrypt.compare(contrasena, user.contrasena_hash);
     if (!isMatch) {

@@ -1,5 +1,6 @@
 // src/controllers/recetasControllers.js
 const pool = require("../db");
+const PDFDocument = require("pdfkit");
 
 /* ============================================================
    Utilidad: ejecutar una función dentro de una transacción
@@ -124,7 +125,7 @@ async function obtenerRecetas(req, res) {
     const result = await pool.query(
       `SELECT
           r.receta_id, r.nombre, r.porciones, r.tiempo_prep_min, r.fecha_creacion,
-          a.asignatura_id, a.nombre_asignatura,
+          a.asignatura_id, a.nombre_asignatura, a.titulacion_id,
           u.nombre_completo AS autor,
           v.version_id, v.numero_version, v.estado AS estado_version,
           v.costo_unitario, v.precio_venta_sugerido
@@ -152,6 +153,77 @@ async function obtenerRecetas(req, res) {
    y menaje de la última versión. Si el que consulta es
    Estudiante (rol 3), valida que tenga acceso asignado.
    ============================================================ */
+/* ============================================================
+   Helper compartido: trae el detalle completo de una receta
+   (ficha + última versión + insumos + menaje). Lo usan tanto
+   obtenerRecetaPorId (JSON para la app) como exportarRecetaPdf
+   (ficha técnica en PDF) para no duplicar las mismas 4 consultas.
+   ============================================================ */
+async function obtenerDetalleRecetaCompleto(id) {
+  const recetaResult = await pool.query(
+    `SELECT r.*, a.nombre_asignatura, a.titulacion_id
+     FROM public.recetas r
+     LEFT JOIN public.asignaturas a ON r.asignatura_id = a.asignatura_id
+     WHERE r.receta_id = $1`,
+    [id]
+  );
+
+  if (recetaResult.rows.length === 0) {
+    return null;
+  }
+  const receta = recetaResult.rows[0];
+
+  const versionesResult = await pool.query(
+    `SELECT * FROM public.recetas_versiones
+     WHERE receta_id = $1
+     ORDER BY version_id DESC`,
+    [id]
+  );
+  // Defensa: si la columna contenido_json quedó guardada como texto plano
+  // (en vez de tipo json/jsonb reconocido por el driver), se parsea aquí
+  // para que siempre se trabaje con un objeto { pasos: [...] } y no un
+  // string en el que "pasos" no existe.
+  const versiones = versionesResult.rows.map((v) => {
+    if (typeof v.contenido_json === "string") {
+      try {
+        v.contenido_json = JSON.parse(v.contenido_json);
+      } catch (e) {
+        console.error("🔴 contenido_json no es JSON válido para version_id", v.version_id, e);
+        v.contenido_json = null;
+      }
+    }
+    return v;
+  });
+  const ultimaVersion = versiones[0] || null;
+
+  let insumos = [];
+  let menaje = [];
+
+  if (ultimaVersion) {
+    const insumosResult = await pool.query(
+      `SELECT rvi.insumo_id, ic.nombre_insumo, ic.unidad_medida,
+              rvi.cantidad, ic.costo_unitario,
+              (rvi.cantidad * ic.costo_unitario) AS subtotal
+       FROM public.receta_version_insumos rvi
+       JOIN public.insumos_costos ic ON rvi.insumo_id = ic.insumo_id
+       WHERE rvi.version_id = $1`,
+      [ultimaVersion.version_id]
+    );
+    insumos = insumosResult.rows;
+
+    const menajeResult = await pool.query(
+      `SELECT ram.articulo_id, ia.nombre, ia.tipo, ram.cantidad_requerida
+       FROM public.receta_articulos_menaje ram
+       JOIN public.inventario_articulos ia ON ram.articulo_id = ia.articulo_id
+       WHERE ram.version_id = $1`,
+      [ultimaVersion.version_id]
+    );
+    menaje = menajeResult.rows;
+  }
+
+  return { receta, versiones, ultimaVersion, insumos, menaje };
+}
+
 async function obtenerRecetaPorId(req, res) {
   const { id } = req.params;
 
@@ -167,68 +239,18 @@ async function obtenerRecetaPorId(req, res) {
       }
     }
 
-    const recetaResult = await pool.query(
-      `SELECT r.*, a.nombre_asignatura
-       FROM public.recetas r
-       LEFT JOIN public.asignaturas a ON r.asignatura_id = a.asignatura_id
-       WHERE r.receta_id = $1`,
-      [id]
-    );
-
-    if (recetaResult.rows.length === 0) {
+    const detalle = await obtenerDetalleRecetaCompleto(id);
+    if (!detalle) {
       return res.status(404).json({ error: "Receta no encontrada." });
     }
-    const receta = recetaResult.rows[0];
 
-    const versionesResult = await pool.query(
-      `SELECT * FROM public.recetas_versiones
-       WHERE receta_id = $1
-       ORDER BY version_id DESC`,
-      [id]
-    );
-    // Defensa: si la columna contenido_json quedó guardada como texto plano
-    // (en vez de tipo json/jsonb reconocido por el driver), se parsea aquí
-    // para que el frontend siempre reciba un objeto { pasos: [...] } y no
-    // un string en el que "pasos" no existe.
-    const versiones = versionesResult.rows.map((v) => {
-      if (typeof v.contenido_json === "string") {
-        try {
-          v.contenido_json = JSON.parse(v.contenido_json);
-        } catch (e) {
-          console.error("🔴 contenido_json no es JSON válido para version_id", v.version_id, e);
-          v.contenido_json = null;
-        }
-      }
-      return v;
+    res.json({
+      receta: detalle.receta,
+      versiones: detalle.versiones,
+      ultima_version: detalle.ultimaVersion,
+      insumos: detalle.insumos,
+      menaje: detalle.menaje
     });
-    const ultimaVersion = versiones[0] || null;
-
-    let insumos = [];
-    let menaje = [];
-
-    if (ultimaVersion) {
-      const insumosResult = await pool.query(
-        `SELECT rvi.insumo_id, ic.nombre_insumo, ic.unidad_medida,
-                rvi.cantidad, ic.costo_unitario,
-                (rvi.cantidad * ic.costo_unitario) AS subtotal
-         FROM public.receta_version_insumos rvi
-         JOIN public.insumos_costos ic ON rvi.insumo_id = ic.insumo_id
-         WHERE rvi.version_id = $1`,
-        [ultimaVersion.version_id]
-      );
-      insumos = insumosResult.rows;
-
-      const menajeResult = await pool.query(
-        `SELECT ram.articulo_id, ia.nombre, ia.tipo, ram.cantidad_requerida
-         FROM public.receta_articulos_menaje ram
-         JOIN public.inventario_articulos ia ON ram.articulo_id = ia.articulo_id
-         WHERE ram.version_id = $1`,
-        [ultimaVersion.version_id]
-      );
-      menaje = menajeResult.rows;
-    }
-
-    res.json({ receta, versiones, ultima_version: ultimaVersion, insumos, menaje });
   } catch (error) {
     console.error("🔴 Error al obtener receta:", error);
     res.status(500).json({ error: "Error interno al obtener la receta." });
@@ -478,6 +500,134 @@ async function misRecetas(req, res) {
   }
 }
 
+/* ============================================================
+   GET /api/recetas/:id/exportar/pdf
+   Genera la ficha técnica de la receta en PDF, formato fijo,
+   igual patrón que el módulo de Reportes: se arma 100% en el
+   backend y se manda como archivo descargable.
+   ============================================================ */
+async function exportarRecetaPdf(req, res) {
+  const { id } = req.params;
+
+  try {
+    if (req.user.rol === 3) {
+      const acceso = await pool.query(
+        `SELECT 1 FROM public.estudiante_receta_acceso
+         WHERE estudiante_id = $1 AND receta_id = $2`,
+        [req.user.id, id]
+      );
+      if (acceso.rows.length === 0) {
+        return res.status(403).json({ error: "No tienes acceso a esta receta." });
+      }
+    }
+
+    const detalle = await obtenerDetalleRecetaCompleto(id);
+    if (!detalle) {
+      return res.status(404).json({ error: "Receta no encontrada." });
+    }
+    const { receta, ultimaVersion, insumos, menaje } = detalle;
+    const pasos = ultimaVersion?.contenido_json?.pasos || [];
+
+    const doc = new PDFDocument({ margin: 45, size: "A4" });
+    const nombreArchivo = `receta-${receta.nombre.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.pdf`;
+
+    res.setHeader("Content-Disposition", `attachment; filename="${nombreArchivo}"`);
+    res.setHeader("Content-Type", "application/pdf");
+    doc.pipe(res);
+
+    // ── Encabezado ──────────────────────────────────────────
+    doc.fillColor("#1a1a1a").font("Helvetica-Bold").fontSize(18).text("NOVA CUISINE");
+    doc.fillColor("#b8860b").font("Helvetica-Bold").fontSize(10).text("FICHA TÉCNICA DE RECETA");
+    doc.moveDown(0.6);
+    doc.moveTo(45, doc.y).lineTo(doc.page.width - 45, doc.y).strokeColor("#b8860b").lineWidth(1.5).stroke();
+    doc.moveDown(0.8);
+
+    // ── Título y datos generales ────────────────────────────
+    doc.fillColor("#1a1a1a").font("Helvetica-Bold").fontSize(20).text(receta.nombre);
+    doc.moveDown(0.3);
+
+    doc.font("Helvetica").fontSize(9).fillColor("#555555");
+    const meta = [
+      receta.nombre_asignatura ? `Asignatura: ${receta.nombre_asignatura}` : null,
+      `Porciones: ${receta.porciones || "-"}`,
+      `Tiempo de preparación: ${receta.tiempo_prep_min ? receta.tiempo_prep_min + " min" : "-"}`,
+      ultimaVersion ? `Versión: ${ultimaVersion.numero_version} (${ultimaVersion.estado})` : null,
+    ].filter(Boolean).join("   ·   ");
+    doc.text(meta);
+    doc.moveDown(1);
+
+    // ── Ingredientes ─────────────────────────────────────────
+    doc.fillColor("#1a1a1a").font("Helvetica-Bold").fontSize(12).text("Ingredientes");
+    doc.moveDown(0.3);
+    doc.font("Helvetica").fontSize(9.5);
+
+    if (insumos.length > 0) {
+      insumos.forEach((ins) => {
+        const cantidadTexto = Number(ins.cantidad) > 0
+          ? `${Number(ins.cantidad)} ${ins.unidad_medida}`
+          : "Al gusto / c/n";
+        doc.fillColor("#1a1a1a").text(`•  ${cantidadTexto}  —  ${ins.nombre_insumo}`);
+      });
+    } else {
+      doc.fillColor("#999999").text("Esta receta aún no tiene ingredientes registrados.");
+    }
+    doc.moveDown(1);
+
+    // ── Menaje / utensilios (solo si aplica) ────────────────
+    if (menaje.length > 0) {
+      doc.fillColor("#1a1a1a").font("Helvetica-Bold").fontSize(12).text("Menaje y Utensilios");
+      doc.moveDown(0.3);
+      doc.font("Helvetica").fontSize(9.5);
+      menaje.forEach((m) => {
+        doc.fillColor("#1a1a1a").text(`•  ${m.cantidad_requerida} x ${m.nombre}`);
+      });
+      doc.moveDown(1);
+    }
+
+    // ── Pasos de preparación ────────────────────────────────
+    doc.fillColor("#1a1a1a").font("Helvetica-Bold").fontSize(12).text("Pasos de Preparación");
+    doc.moveDown(0.3);
+    doc.font("Helvetica").fontSize(9.5);
+
+    if (pasos.length > 0) {
+      const xNumero = doc.page.margins.left;
+      const xTexto = doc.page.margins.left + 24;
+      const anchoTexto = doc.page.width - xTexto - doc.page.margins.right;
+
+      pasos.forEach((paso, i) => {
+        const numero = `${i + 1}.`;
+
+        // Salto de página manual si el paso no cabe en lo que queda de hoja
+        const alturaEstimada = doc.heightOfString(paso, { width: anchoTexto });
+        if (doc.y + alturaEstimada > doc.page.height - doc.page.margins.bottom) {
+          doc.addPage();
+        }
+
+        const yInicio = doc.y;
+        doc.fillColor("#b8860b").font("Helvetica-Bold").text(numero, xNumero, yInicio, { width: 20 });
+        doc.fillColor("#1a1a1a").font("Helvetica").text(paso, xTexto, yInicio, { width: anchoTexto });
+        doc.moveDown(0.6);
+      });
+    } else {
+      doc.fillColor("#999999").text("Aún no se han registrado los pasos de preparación de esta receta.");
+    }
+
+    // ── Pie de página ────────────────────────────────────────
+    doc.moveDown(1);
+    doc.fontSize(7.5).fillColor("#aaaaaa")
+      .text(`Generado desde Nova Cuisine el ${new Date().toLocaleString("es-EC")}`, { align: "center" });
+
+    doc.end();
+  } catch (error) {
+    console.error("🔴 Error al exportar receta a PDF:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Error al generar el PDF de la receta." });
+    } else {
+      res.end();
+    }
+  }
+}
+
 module.exports = {
   crearReceta,
   obtenerRecetas,
@@ -488,4 +638,5 @@ module.exports = {
   aprobarVersion,
   asignarReceta,
   misRecetas,
+  exportarRecetaPdf,
 };

@@ -7,7 +7,20 @@ const { verifyToken, authorizeRoles } = require("../middleware/authMiddleware");
 
 const soloAdmin      = authorizeRoles(1);
 const soloEstudiante = authorizeRoles(3);
-const upload         = multer({ storage: multer.memoryStorage() });
+const upload         = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB — de sobra para un Excel de obligaciones
+    fileFilter: (req, file, cb) => {
+        const tiposPermitidos = [
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ];
+        if (!tiposPermitidos.includes(file.mimetype)) {
+            return cb(new Error("Solo se permiten archivos Excel (.xls, .xlsx)."));
+        }
+        cb(null, true);
+    }
+});
 
 router.use(verifyToken);
 

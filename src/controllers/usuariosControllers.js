@@ -186,10 +186,80 @@ async function desactivarUsuario(req, res) {
     }
 }
 
+/* ============================================================
+   6. GET /api/usuarios/mi-perfil  (cualquier usuario autenticado,
+   consulta SUS PROPIOS datos — no requiere ser Admin)
+   Si es Docente (rol_id 2), además trae estadísticas reales:
+   grupos a cargo, estudiantes totales, recetas creadas y las
+   asignaturas que imparte.
+   ============================================================ */
+async function obtenerMiPerfil(req, res) {
+    try {
+        const result = await pool.query(
+            `SELECT usuario_id, nombre_completo, email, rol_id, activo
+             FROM public.usuarios
+             WHERE usuario_id = $1`,
+            [req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Usuario no encontrado." });
+        }
+
+        const usuario = result.rows[0];
+        let stats = null;
+
+        if (usuario.rol_id === 2) {
+            const [grupos, estudiantes, recetas, asignaturas] = await Promise.all([
+                pool.query(
+                    `SELECT COUNT(*)::int AS total
+                     FROM public.horarios_clase
+                     WHERE docente_id = $1`,
+                    [req.user.id]
+                ),
+                pool.query(
+                    `SELECT COUNT(DISTINCT m.estudiante_id)::int AS total
+                     FROM public.matriculas_horario m
+                     JOIN public.horarios_clase h ON m.horario_id = h.horario_id
+                     WHERE h.docente_id = $1`,
+                    [req.user.id]
+                ),
+                pool.query(
+                    `SELECT COUNT(*)::int AS total
+                     FROM public.recetas
+                     WHERE usuario_creador_id = $1`,
+                    [req.user.id]
+                ),
+                pool.query(
+                    `SELECT DISTINCT a.asignatura_id, a.nombre_asignatura
+                     FROM public.horarios_clase h
+                     JOIN public.asignaturas a ON h.asignatura_id = a.asignatura_id
+                     WHERE h.docente_id = $1
+                     ORDER BY a.nombre_asignatura`,
+                    [req.user.id]
+                ),
+            ]);
+
+            stats = {
+                total_grupos: grupos.rows[0].total,
+                total_estudiantes: estudiantes.rows[0].total,
+                total_recetas: recetas.rows[0].total,
+                asignaturas: asignaturas.rows
+            };
+        }
+
+        res.json({ usuario, stats });
+    } catch (error) {
+        console.error("🔴 Error al obtener mi perfil:", error);
+        res.status(500).json({ error: "Error al obtener tu perfil." });
+    }
+}
+
 module.exports = {
     crearUsuario,
     obtenerUsuarios,
     obtenerUsuarioPorId,
     actualizarUsuario,
-    desactivarUsuario
+    desactivarUsuario,
+    obtenerMiPerfil
 };

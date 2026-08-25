@@ -25,5 +25,17 @@ app.get("/api/admin", verifyToken, authorizeRoles("Admininstrador"), (req, res) 
   res.json({ message: "Bienvenido, Admin!" });
 });
 
+// Manejador de errores centralizado — sin esto, un error de multer (archivo muy
+// grande o de tipo no permitido) o cualquier excepción no controlada devolvía
+// una página HTML de error en vez de JSON, y el frontend no podía mostrar
+// el mensaje real en el toast (esperaba siempre { error: "..." }).
+app.use((err, req, res, next) => {
+  console.error("🔴 Error no controlado:", err.message);
+  if (err.name === "MulterError" || err.message?.includes("Excel")) {
+    return res.status(400).json({ error: err.message });
+  }
+  res.status(500).json({ error: "Ocurrió un error interno en el servidor." });
+});
+
 const PORT = 3000;
 app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));

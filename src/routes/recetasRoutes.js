@@ -20,6 +20,7 @@ router.get("/", adminODocente, c.obtenerRecetas);
 
 // Detalle: todos los roles (el controller valida acceso del estudiante internamente)
 router.get("/:id", todos, c.obtenerRecetaPorId);
+router.get("/:id/exportar/pdf", todos, c.exportarRecetaPdf);
 router.put("/:id", adminODocente, c.actualizarReceta);
 router.delete("/:id", adminODocente, c.eliminarReceta);
 

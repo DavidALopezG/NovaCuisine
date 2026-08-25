@@ -1,6 +1,47 @@
 // src/controllers/horariosControllers.js
 const pool = require("../db");
 
+/**
+ * Valida hora_fin > hora_inicio y que no exista un choque de horario:
+ * mismo día + mismo docente (si tiene) O misma aula (si tiene), con
+ * un rango de horas que se solapa con otro bloque ya existente.
+ * `excluirHorarioId` se usa al editar, para no chocar contra sí mismo.
+ */
+async function validarHorarioSinConflicto({ dia_semana, hora_inicio, hora_fin, docente_id, aula, excluirHorarioId }) {
+    if (hora_fin <= hora_inicio) {
+        return "La hora de fin debe ser posterior a la hora de inicio.";
+    }
+
+    const condiciones = [`dia_semana = $1`, `hora_inicio < $2`, `hora_fin > $3`];
+    const params = [dia_semana, hora_fin, hora_inicio];
+
+    const condicionesChoque = [];
+    if (docente_id) {
+        params.push(docente_id);
+        condicionesChoque.push(`docente_id = $${params.length}`);
+    }
+    if (aula) {
+        params.push(aula);
+        condicionesChoque.push(`aula = $${params.length}`);
+    }
+    if (condicionesChoque.length === 0) {
+        return null; // Sin docente ni aula asignados todavía, no hay contra qué comparar
+    }
+    condiciones.push(`(${condicionesChoque.join(" OR ")})`);
+
+    let query = `SELECT horario_id FROM public.horarios_clase WHERE ${condiciones.join(" AND ")}`;
+    if (excluirHorarioId) {
+        params.push(excluirHorarioId);
+        query += ` AND horario_id <> $${params.length}`;
+    }
+
+    const choque = await pool.query(query, params);
+    if (choque.rows.length > 0) {
+        return "Ya existe otro bloque de horario en ese día/hora para el mismo docente o la misma aula.";
+    }
+    return null;
+}
+
 /* ============================================================
    1. POST /api/horarios  (Admin/Docente)
    Crea un bloque de horario para una asignatura
@@ -18,6 +59,11 @@ async function crearHorario(req, res) {
     // Si quien crea es Docente (rol 2) y no especifica otro docente, se asigna a sí mismo
     if (req.user.rol === 2 && !docente_id) {
         docente_id = req.user.id;
+    }
+
+    const errorConflicto = await validarHorarioSinConflicto({ dia_semana, hora_inicio, hora_fin, docente_id, aula });
+    if (errorConflicto) {
+        return res.status(409).json({ error: errorConflicto });
     }
 
     try {
@@ -134,6 +180,16 @@ async function actualizarHorario(req, res) {
             }
             // Un docente jamás puede reasignar el grupo a otro docente desde este endpoint
             docente_id = existente.rows[0].docente_id;
+        }
+
+        const errorConflicto = await validarHorarioSinConflicto({
+            dia_semana, hora_inicio, hora_fin,
+            docente_id: docente_id || existente.rows[0].docente_id,
+            aula,
+            excluirHorarioId: id
+        });
+        if (errorConflicto) {
+            return res.status(409).json({ error: errorConflicto });
         }
 
         const result = await pool.query(

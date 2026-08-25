@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
-const JWT_SECRET = process.env.JWT_SECRET || "clave-super-segura";
+const { requireEnv } = require("../config/env");
+const JWT_SECRET = requireEnv("JWT_SECRET"); // antes tenía un valor hardcodeado aquí
 
 function verifyToken(req, res, next) {
   const token = req.headers["authorization"]?.split(" ")[1];
