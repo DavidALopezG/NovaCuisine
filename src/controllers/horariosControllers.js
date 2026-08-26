@@ -48,13 +48,18 @@ async function validarHorarioSinConflicto({ dia_semana, hora_inicio, hora_fin, d
    ============================================================ */
 async function crearHorario(req, res) {
     const { asignatura_id, dia_semana, hora_inicio, hora_fin, aula } = req.body;
-    let { docente_id } = req.body;
+    let { docente_id, modalidad } = req.body;
 
     if (!asignatura_id || !dia_semana || !hora_inicio || !hora_fin) {
         return res.status(400).json({
             error: "asignatura_id, dia_semana, hora_inicio y hora_fin son obligatorios."
         });
     }
+
+    if (modalidad && !["Presencial", "Intensivo"].includes(modalidad)) {
+        return res.status(400).json({ error: "modalidad debe ser 'Presencial' o 'Intensivo'." });
+    }
+    modalidad = modalidad || "Presencial";
 
     // Si quien crea es Docente (rol 2) y no especifica otro docente, se asigna a sí mismo
     if (req.user.rol === 2 && !docente_id) {
@@ -69,10 +74,10 @@ async function crearHorario(req, res) {
     try {
         const result = await pool.query(
             `INSERT INTO public.horarios_clase
-                (asignatura_id, docente_id, dia_semana, hora_inicio, hora_fin, aula)
-             VALUES ($1, $2, $3, $4, $5, $6)
+                (asignatura_id, docente_id, dia_semana, hora_inicio, hora_fin, aula, modalidad)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING *`,
-            [asignatura_id, docente_id || null, dia_semana, hora_inicio, hora_fin, aula || null]
+            [asignatura_id, docente_id || null, dia_semana, hora_inicio, hora_fin, aula || null, modalidad]
         );
 
         res.status(201).json({ message: "Horario creado correctamente.", horario: result.rows[0] });
@@ -90,13 +95,14 @@ async function obtenerHorarios(req, res) {
         const filtroDocente = req.user.rol === 2;
 
         const result = await pool.query(
-            `SELECT h.horario_id, h.dia_semana, h.hora_inicio, h.hora_fin, h.aula,
+            `SELECT h.horario_id, h.dia_semana, h.hora_inicio, h.hora_fin, h.aula, h.modalidad,
                     a.asignatura_id, a.nombre_asignatura, a.titulacion_id,
                     u.usuario_id AS docente_id, u.nombre_completo AS docente_nombre,
                     (
                       SELECT COUNT(*)::int FROM public.matriculas_horario m
                       WHERE m.horario_id = h.horario_id
-                    ) AS alumnos_matriculados
+                    ) AS alumnos_matriculados,
+                    ${CUPO_MAXIMO_POR_HORARIO} AS cupo_maximo
              FROM public.horarios_clase h
              JOIN public.asignaturas a ON h.asignatura_id = a.asignatura_id
              LEFT JOIN public.usuarios u ON h.docente_id = u.usuario_id
@@ -156,7 +162,7 @@ async function eliminarHorario(req, res) {
 async function actualizarHorario(req, res) {
     const { id } = req.params;
     const { asignatura_id, dia_semana, hora_inicio, hora_fin, aula } = req.body;
-    let { docente_id } = req.body;
+    let { docente_id, modalidad } = req.body;
 
     if (!asignatura_id || !dia_semana || !hora_inicio || !hora_fin) {
         return res.status(400).json({
@@ -164,9 +170,13 @@ async function actualizarHorario(req, res) {
         });
     }
 
+    if (modalidad && !["Presencial", "Intensivo"].includes(modalidad)) {
+        return res.status(400).json({ error: "modalidad debe ser 'Presencial' o 'Intensivo'." });
+    }
+
     try {
         const existente = await pool.query(
-            `SELECT docente_id FROM public.horarios_clase WHERE horario_id = $1`,
+            `SELECT docente_id, modalidad FROM public.horarios_clase WHERE horario_id = $1`,
             [id]
         );
 
@@ -181,6 +191,8 @@ async function actualizarHorario(req, res) {
             // Un docente jamás puede reasignar el grupo a otro docente desde este endpoint
             docente_id = existente.rows[0].docente_id;
         }
+
+        modalidad = modalidad || existente.rows[0].modalidad || "Presencial";
 
         const errorConflicto = await validarHorarioSinConflicto({
             dia_semana, hora_inicio, hora_fin,
@@ -199,10 +211,11 @@ async function actualizarHorario(req, res) {
                     dia_semana    = $3,
                     hora_inicio   = $4,
                     hora_fin      = $5,
-                    aula          = $6
-              WHERE horario_id = $7
+                    aula          = $6,
+                    modalidad     = $7
+              WHERE horario_id = $8
               RETURNING *`,
-            [asignatura_id, docente_id || existente.rows[0].docente_id, dia_semana, hora_inicio, hora_fin, aula || null, id]
+            [asignatura_id, docente_id || existente.rows[0].docente_id, dia_semana, hora_inicio, hora_fin, aula || null, modalidad, id]
         );
 
         res.json({ message: "Grupo/horario actualizado correctamente.", horario: result.rows[0] });
@@ -282,33 +295,122 @@ async function obtenerEstudiantesDeHorario(req, res) {
    6. POST /api/horarios/:id/estudiantes  (Admin/Docente)
    Matricula un estudiante en un bloque de horario/grupo
    ============================================================ */
+// Cupo máximo por horario/grupo, según reglas institucionales (folleto de inscripción).
+const CUPO_MAXIMO_POR_HORARIO = 6;
+
+/**
+ * Busca si el estudiante ya está matriculado en OTRO horario que se
+ * solapa en día/hora con el horario destino. Se usa para advertir de
+ * cruces de horario a nivel de estudiante (patrón "permitir + confirmar",
+ * igual que el cruce de titulación ya existente en el frontend).
+ */
+async function buscarConflictoHorarioEstudiante(client, estudianteId, horarioDestino) {
+    const result = await client.query(
+        `SELECT h.horario_id, h.dia_semana, h.hora_inicio, h.hora_fin, a.nombre_asignatura
+         FROM public.matriculas_horario m
+         JOIN public.horarios_clase h ON h.horario_id = m.horario_id
+         LEFT JOIN public.asignaturas a ON a.asignatura_id = h.asignatura_id
+         WHERE m.estudiante_id = $1
+           AND h.horario_id <> $2
+           AND h.dia_semana = $3
+           AND h.hora_inicio < $4
+           AND h.hora_fin > $5`,
+        [
+            estudianteId,
+            horarioDestino.horario_id,
+            horarioDestino.dia_semana,
+            horarioDestino.hora_fin,
+            horarioDestino.hora_inicio
+        ]
+    );
+    return result.rows;
+}
+
+/**
+ * Matricula a un estudiante en un horario/grupo respetando el cupo máximo.
+ * Usa un client dedicado con transacción + FOR UPDATE sobre el horario para
+ * evitar condición de carrera: si dos matrículas llegan casi al mismo tiempo
+ * cuando queda 1 cupo, solo una debe pasar.
+ *
+ * También valida cruces de horario a nivel de estudiante (mismo estudiante
+ * matriculado en dos grupos que se solapan en día/hora). Sigue el patrón
+ * "permitir + confirmar": si hay cruce y el body no trae forzar=true,
+ * responde 409 con el detalle del cruce para que el frontend muestre
+ * confirmación; si el usuario confirma, reenvía la petición con forzar=true.
+ */
 async function matricularEstudiante(req, res) {
     const { id } = req.params;
-    const { estudiante_id } = req.body;
+    const { estudiante_id, forzar } = req.body;
 
     if (!estudiante_id) {
         return res.status(400).json({ error: "estudiante_id es obligatorio." });
     }
 
+    const client = await pool.connect();
     try {
-        const horario = await pool.query(
-            `SELECT docente_id FROM public.horarios_clase WHERE horario_id = $1`,
+        await client.query("BEGIN");
+
+        // FOR UPDATE bloquea la fila del horario para serializar matrículas concurrentes
+        const horario = await client.query(
+            `SELECT horario_id, docente_id, dia_semana, hora_inicio, hora_fin
+             FROM public.horarios_clase WHERE horario_id = $1 FOR UPDATE`,
             [id]
         );
         if (horario.rows.length === 0) {
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Horario no encontrado." });
         }
         if (req.user.rol === 2 && Number(horario.rows[0].docente_id) !== Number(req.user.id)) {
+            await client.query("ROLLBACK");
             return res.status(403).json({ error: "No puedes matricular estudiantes en un grupo que no te pertenece." });
         }
 
-        const result = await pool.query(
+        // ¿Ya está matriculado? Si sí, no cuenta contra el cupo, solo se informa.
+        const yaMatriculado = await client.query(
+            `SELECT 1 FROM public.matriculas_horario WHERE horario_id = $1 AND estudiante_id = $2`,
+            [id, estudiante_id]
+        );
+        if (yaMatriculado.rows.length > 0) {
+            await client.query("ROLLBACK");
+            return res.status(200).json({
+                message: "El estudiante ya estaba matriculado en este grupo.",
+                matricula: null
+            });
+        }
+
+        // Cruce de horario a nivel de estudiante: permitir + confirmar.
+        if (!forzar) {
+            const cruces = await buscarConflictoHorarioEstudiante(client, estudiante_id, horario.rows[0]);
+            if (cruces.length > 0) {
+                await client.query("ROLLBACK");
+                return res.status(409).json({
+                    error: "El estudiante ya tiene otro grupo matriculado que se cruza en día y hora con este horario.",
+                    tipo: "CRUCE_HORARIO_ESTUDIANTE",
+                    cruces
+                });
+            }
+        }
+
+        const conteo = await client.query(
+            `SELECT COUNT(*)::int AS total FROM public.matriculas_horario WHERE horario_id = $1`,
+            [id]
+        );
+        if (conteo.rows[0].total >= CUPO_MAXIMO_POR_HORARIO) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+                error: `Cupo máximo alcanzado (${CUPO_MAXIMO_POR_HORARIO} estudiantes) para este horario.`
+            });
+        }
+
+        const result = await client.query(
             `INSERT INTO public.matriculas_horario (horario_id, estudiante_id)
              VALUES ($1, $2)
              ON CONFLICT (horario_id, estudiante_id) DO NOTHING
              RETURNING *`,
             [id, estudiante_id]
         );
+
+        await client.query("COMMIT");
 
         res.status(201).json({
             message: result.rows.length > 0
@@ -317,11 +419,14 @@ async function matricularEstudiante(req, res) {
             matricula: result.rows[0] || null
         });
     } catch (error) {
+        await client.query("ROLLBACK");
         if (error.code === "23503") {
             return res.status(400).json({ error: "El horario o el estudiante no existen." });
         }
         console.error("🔴 Error al matricular estudiante:", error);
         res.status(500).json({ error: "Error interno al matricular al estudiante." });
+    } finally {
+        client.release();
     }
 }
 

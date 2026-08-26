@@ -53,7 +53,9 @@ async function obtenerObligaciones(req, res) {
             `SELECT co.*, e.nombre, e.apellido, e.codigo_estudiante
              FROM public.cobros_obligaciones co
              LEFT JOIN public.estudiantes e ON co.estudiante_id = e.estudiante_id
-             ORDER BY co.fecha_vencimiento ASC`
+             ORDER BY
+                CASE WHEN co.comprobante_estado = 'PENDIENTE' THEN 0 ELSE 1 END,
+                co.fecha_vencimiento ASC`
         );
         res.json(result.rows);
     } catch (error) {
@@ -76,8 +78,31 @@ async function registrarPago(req, res) {
 
     const client = await pool.connect(); // ← cliente dedicado (FIX)
     try {
-        await client.query("BEGIN");
+        const resultado = await aplicarPago(client, obligacion_id, monto_pago);
+        res.json({
+            message: "Pago registrado correctamente.",
+            obligacion: resultado
+        });
+    } catch (error) {
+        if (error.httpStatus) {
+            return res.status(error.httpStatus).json({ error: error.message });
+        }
+        console.error("🔴 registrarPago:", error);
+        res.status(500).json({ error: "Error interno al registrar el pago." });
+    } finally {
+        client.release(); // ← siempre liberar el cliente
+    }
+}
 
+/**
+ * Aplica un pago sobre una obligación dentro de su propia transacción.
+ * Reutilizado tanto por registrarPago (pago manual del admin) como por
+ * aprobarComprobante (pago derivado de un comprobante subido por el
+ * estudiante y aprobado por el admin).
+ */
+async function aplicarPago(client, obligacion_id, monto_pago) {
+    await client.query("BEGIN");
+    try {
         const oblRes = await client.query(
             `SELECT monto_total, monto_pagado, estado
              FROM public.cobros_obligaciones
@@ -87,14 +112,14 @@ async function registrarPago(req, res) {
 
         if (oblRes.rows.length === 0) {
             await client.query("ROLLBACK");
-            return res.status(404).json({ error: "Obligación no encontrada." });
+            throw Object.assign(new Error("Obligación no encontrada."), { httpStatus: 404 });
         }
 
         const obl = oblRes.rows[0];
 
         if (obl.estado === "PAGADO") {
             await client.query("ROLLBACK");
-            return res.status(400).json({ error: "Esta obligación ya está completamente pagada." });
+            throw Object.assign(new Error("Esta obligación ya está completamente pagada."), { httpStatus: 400 });
         }
 
         const nuevoMontoPagado = parseFloat(obl.monto_pagado) + parseFloat(monto_pago);
@@ -102,7 +127,7 @@ async function registrarPago(req, res) {
 
         if (montoPendiente < -0.01) {
             await client.query("ROLLBACK");
-            return res.status(400).json({ error: "El monto del pago excede la deuda restante." });
+            throw Object.assign(new Error("El monto del pago excede la deuda restante."), { httpStatus: 400 });
         }
 
         // FIX de estados: todos en MAYÚSCULAS para coincidir con VISTA_ESTADO_COBROS y CSS
@@ -118,17 +143,10 @@ async function registrarPago(req, res) {
         );
 
         await client.query("COMMIT");
-
-        res.json({
-            message: "Pago registrado correctamente.",
-            obligacion: updateRes.rows[0]
-        });
+        return updateRes.rows[0];
     } catch (error) {
-        await client.query("ROLLBACK");
-        console.error("🔴 registrarPago:", error);
-        res.status(500).json({ error: "Error interno al registrar el pago." });
-    } finally {
-        client.release(); // ← siempre liberar el cliente
+        try { await client.query("ROLLBACK"); } catch (_) { /* ya en rollback */ }
+        throw error;
     }
 }
 
@@ -225,7 +243,12 @@ async function obtenerMisObligaciones(req, res) {
                 monto_pagado,
                 (monto_total - monto_pagado) AS saldo_pendiente,
                 estado,
-                fecha_pago
+                fecha_pago,
+                comprobante_ruta,
+                comprobante_monto_declarado,
+                comprobante_estado,
+                comprobante_fecha_subida,
+                comprobante_observacion
              FROM public.cobros_obligaciones
              WHERE estudiante_id = $1
              ORDER BY fecha_vencimiento ASC`,
@@ -235,6 +258,139 @@ async function obtenerMisObligaciones(req, res) {
     } catch (error) {
         console.error("🔴 obtenerMisObligaciones:", error);
         res.status(500).json({ error: "Error al obtener tu estado de cuenta." });
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   5b. POST /api/cobros/obligaciones/:id/comprobante  (Estudiante)
+   El estudiante sube su comprobante de transferencia/Deuna para
+   una obligación propia. Queda en estado PENDIENTE hasta que el
+   admin lo revise y apruebe (lo cual dispara aplicarPago) o lo
+   rechace.
+   ═══════════════════════════════════════════════════════════ */
+async function subirComprobante(req, res) {
+    const { id } = req.params;
+    const { monto_declarado } = req.body;
+
+    if (!req.file) {
+        return res.status(400).json({ error: "Debes adjuntar el comprobante (imagen o PDF)." });
+    }
+    if (!monto_declarado || isNaN(Number(monto_declarado)) || Number(monto_declarado) <= 0) {
+        return res.status(400).json({ error: "monto_declarado debe ser un número mayor a 0." });
+    }
+
+    try {
+        // Solo puede subir comprobante de una obligación que le pertenece a él mismo
+        const obligacion = await pool.query(
+            `SELECT estudiante_id, estado FROM public.cobros_obligaciones WHERE obligacion_id = $1`,
+            [id]
+        );
+        if (obligacion.rows.length === 0) {
+            return res.status(404).json({ error: "Obligación no encontrada." });
+        }
+        if (Number(obligacion.rows[0].estudiante_id) !== Number(req.user.id)) {
+            return res.status(403).json({ error: "No puedes subir un comprobante para una obligación que no es tuya." });
+        }
+        if (obligacion.rows[0].estado === "PAGADO") {
+            return res.status(400).json({ error: "Esta obligación ya está completamente pagada." });
+        }
+
+        const rutaPublica = `/uploads/comprobantes/${req.file.filename}`;
+        const result = await pool.query(
+            `UPDATE public.cobros_obligaciones
+             SET comprobante_ruta = $1,
+                 comprobante_monto_declarado = $2,
+                 comprobante_estado = 'PENDIENTE',
+                 comprobante_fecha_subida = NOW(),
+                 comprobante_observacion = NULL
+             WHERE obligacion_id = $3
+             RETURNING *`,
+            [rutaPublica, monto_declarado, id]
+        );
+
+        res.status(201).json({
+            message: "Comprobante subido. Un administrador lo revisará antes de aplicarlo como pago.",
+            obligacion: result.rows[0]
+        });
+    } catch (error) {
+        console.error("🔴 subirComprobante:", error);
+        res.status(500).json({ error: "Error interno al subir el comprobante." });
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   5c. PUT /api/cobros/obligaciones/:id/comprobante/aprobar  (Admin)
+   Aplica el monto declarado del comprobante como pago real
+   (reutiliza la misma lógica transaccional que registrarPago).
+   ═══════════════════════════════════════════════════════════ */
+async function aprobarComprobante(req, res) {
+    const { id } = req.params;
+
+    const client = await pool.connect();
+    try {
+        const obligacion = await pool.query(
+            `SELECT comprobante_estado, comprobante_monto_declarado
+             FROM public.cobros_obligaciones WHERE obligacion_id = $1`,
+            [id]
+        );
+        if (obligacion.rows.length === 0) {
+            return res.status(404).json({ error: "Obligación no encontrada." });
+        }
+        if (obligacion.rows[0].comprobante_estado !== "PENDIENTE") {
+            return res.status(400).json({ error: "Esta obligación no tiene un comprobante pendiente de revisión." });
+        }
+
+        const montoAplicar = obligacion.rows[0].comprobante_monto_declarado;
+        const actualizada = await aplicarPago(client, id, montoAplicar);
+
+        const resultado = await pool.query(
+            `UPDATE public.cobros_obligaciones
+             SET comprobante_estado = 'APROBADO'
+             WHERE obligacion_id = $1
+             RETURNING *`,
+            [id]
+        );
+
+        res.json({
+            message: `Comprobante aprobado. Se aplicó un pago de $${montoAplicar}.`,
+            obligacion: resultado.rows[0] || actualizada
+        });
+    } catch (error) {
+        if (error.httpStatus) {
+            return res.status(error.httpStatus).json({ error: error.message });
+        }
+        console.error("🔴 aprobarComprobante:", error);
+        res.status(500).json({ error: "Error interno al aprobar el comprobante." });
+    } finally {
+        client.release();
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   5d. PUT /api/cobros/obligaciones/:id/comprobante/rechazar  (Admin)
+   ═══════════════════════════════════════════════════════════ */
+async function rechazarComprobante(req, res) {
+    const { id } = req.params;
+    const { observacion } = req.body;
+
+    try {
+        const result = await pool.query(
+            `UPDATE public.cobros_obligaciones
+             SET comprobante_estado = 'RECHAZADO',
+                 comprobante_observacion = $1
+             WHERE obligacion_id = $2 AND comprobante_estado = 'PENDIENTE'
+             RETURNING *`,
+            [observacion || "Comprobante rechazado por el administrador.", id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(400).json({ error: "Esta obligación no tiene un comprobante pendiente de revisión." });
+        }
+
+        res.json({ message: "Comprobante rechazado.", obligacion: result.rows[0] });
+    } catch (error) {
+        console.error("🔴 rechazarComprobante:", error);
+        res.status(500).json({ error: "Error interno al rechazar el comprobante." });
     }
 }
 
@@ -290,5 +446,8 @@ module.exports = {
     registrarPago,
     importarObligacionesExcel,
     obtenerMisObligaciones,
-    obtenerResumenFinanciero
+    obtenerResumenFinanciero,
+    subirComprobante,
+    aprobarComprobante,
+    rechazarComprobante
 };

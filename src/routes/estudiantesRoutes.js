@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const estudiantesController = require('../controllers/estudianteControllers');
 const { verifyToken, authorizeRoles } = require('../middleware/authMiddleware');
+const { uploadFotoEstudiante } = require('../middleware/uploadArchivos');
 
 const soloAdmin = authorizeRoles(1);
 const adminODocente = authorizeRoles(1, 2);
@@ -16,6 +17,7 @@ router.get('/perfil/me', soloEstudiante, estudiantesController.obtenerMiPerfil);
 router.post('/', soloAdmin, estudiantesController.crearEstudiante);
 router.get('/', adminODocente, estudiantesController.obtenerEstudiantes); // Docente necesita listar para asignar recetas
 router.get('/:id/detalle', soloAdmin, estudiantesController.obtenerDetalleEstudiante); // Expediente con recetas asignadas
+router.post('/:id/foto', soloAdmin, uploadFotoEstudiante.single('foto'), estudiantesController.subirFotoEstudiante); // Foto tipo carnet
 router.get('/:id', soloAdmin, estudiantesController.obtenerEstudiantePorId);
 router.put('/:id', soloAdmin, estudiantesController.actualizarEstudiante);
 router.delete('/:id', soloAdmin, estudiantesController.eliminarEstudiante);

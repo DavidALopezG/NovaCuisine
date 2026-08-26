@@ -4,6 +4,7 @@ const router   = express.Router();
 const multer   = require("multer");
 const c        = require("../controllers/cobrosControllers");
 const { verifyToken, authorizeRoles } = require("../middleware/authMiddleware");
+const { uploadComprobante } = require("../middleware/uploadArchivos");
 
 const soloAdmin      = authorizeRoles(1);
 const soloEstudiante = authorizeRoles(3);
@@ -25,7 +26,8 @@ const upload         = multer({
 router.use(verifyToken);
 
 // ── Estudiante ─────────────────────────────────────────────
-router.get("/mis-obligaciones", soloEstudiante, c.obtenerMisObligaciones);
+router.get("/mis-obligaciones",                     soloEstudiante, c.obtenerMisObligaciones);
+router.post("/obligaciones/:id/comprobante",         soloEstudiante, uploadComprobante.single("comprobante"), c.subirComprobante);
 
 // ── Admin ──────────────────────────────────────────────────
 router.get("/resumen",                          soloAdmin, c.obtenerResumenFinanciero);
@@ -33,5 +35,7 @@ router.get("/obligaciones",                     soloAdmin, c.obtenerObligaciones
 router.post("/obligaciones",                    soloAdmin, c.crearObligacion);
 router.post("/obligaciones/importar-excel",     soloAdmin, upload.single("archivo"), c.importarObligacionesExcel);
 router.put("/pagar",                            soloAdmin, c.registrarPago);
+router.put("/obligaciones/:id/comprobante/aprobar",  soloAdmin, c.aprobarComprobante);
+router.put("/obligaciones/:id/comprobante/rechazar", soloAdmin, c.rechazarComprobante);
 
 module.exports = router;

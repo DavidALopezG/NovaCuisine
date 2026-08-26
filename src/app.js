@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 const authRoutes = require("./routes/authRoutes");
 const cobrosRoutes = require("./routes/cobrosRoutes");
 const { verifyToken, authorizeRoles } = require("./middleware/authMiddleware");
@@ -8,6 +9,12 @@ const app = express();
 
 app.use(express.json());
 app.use(cors());
+
+// Sirve fotos de estudiante y comprobantes de pago subidos vía multer
+// (diskStorage en src/middleware/uploadArchivos.js). Requiere sesión iniciada
+// en el frontend para llegar a esta URL, pero el archivo en sí no exige token
+// porque <img>/<a> del navegador no pueden enviar Authorization header.
+app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 
 // Rutas organizadas
 app.use("/api/auth", authRoutes);
@@ -31,7 +38,7 @@ app.get("/api/admin", verifyToken, authorizeRoles("Admininstrador"), (req, res) 
 // el mensaje real en el toast (esperaba siempre { error: "..." }).
 app.use((err, req, res, next) => {
   console.error("🔴 Error no controlado:", err.message);
-  if (err.name === "MulterError" || err.message?.includes("Excel")) {
+  if (err.name === "MulterError" || err.message?.includes("Excel") || err.message?.includes("imagen") || err.message?.includes("comprobante") || err.message?.includes("PDF")) {
     return res.status(400).json({ error: err.message });
   }
   res.status(500).json({ error: "Ocurrió un error interno en el servidor." });
