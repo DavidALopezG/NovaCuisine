@@ -11,8 +11,8 @@ router.use(verifyToken);
 // Cualquier usuario autenticado puede ver el listado (se usa en filtros/formularios)
 router.get("/", authorizeRoles(1, 2, 3), asignaturasController.obtenerAsignaturas);
 
-// Solo Admin/Docente puede crear asignaturas nuevas
-router.post("/", authorizeRoles(1, 2), asignaturasController.crearAsignatura);
+// El pensum es materia institucional: crear, editar y eliminar es exclusivo del Administrador
+router.post("/", soloAdmin, asignaturasController.crearAsignatura);
 
 // El pensum (nivel, electivas, renombrar) es materia sensible del plan de
 // estudios: editar/eliminar queda reservado exclusivamente al Administrador,

@@ -1,6 +1,12 @@
 // src/controllers/cobrosControllers.js
 const pool = require("../db");
 const XLSX = require("xlsx");
+const { aCentavos } = require("../utils/validaciones");
+const { aplicarRecargos, aplicarRecargosSiToca, estadoRealSql } = require("../utils/cobrosCore");
+
+// Tope razonable de una obligación individual (USD). Evita montos absurdos por error de digitación.
+const MONTO_MAXIMO_OBLIGACION = 10000;
+const MAX_FILAS_EXCEL = 500;
 
 // Fecha de vencimiento por defecto: 3 meses a partir de hoy
 const calcularFechaVencimiento = () => {
@@ -9,30 +15,73 @@ const calcularFechaVencimiento = () => {
     return d;
 };
 
+/** Convierte a Date válida o devuelve null. Acepta Date, ISO "YYYY-MM-DD" y fechas de Excel. */
+function parsearFecha(valor) {
+    if (valor === null || valor === undefined || valor === "") return null;
+    const d = valor instanceof Date ? valor : new Date(valor);
+    return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Inicio del día de hoy (para comparar fechas de vencimiento sin la hora). */
+function inicioDeHoy() {
+    const h = new Date();
+    h.setHours(0, 0, 0, 0);
+    return h;
+}
+
 /* ═══════════════════════════════════════════════════════════
    1. POST /api/cobros/obligaciones  (Admin)
    ═══════════════════════════════════════════════════════════ */
 async function crearObligacion(req, res) {
     const { estudiante_id, monto_total, fecha_vencimiento } = req.body;
+    const concepto = req.body.concepto ? String(req.body.concepto).trim().slice(0, 120) : null;
 
     if (!estudiante_id || !monto_total) {
         return res.status(400).json({ error: "estudiante_id y monto_total son obligatorios." });
     }
 
-    if (isNaN(monto_total) || Number(monto_total) <= 0) {
-        return res.status(400).json({ error: "monto_total debe ser un número mayor a 0." });
+    const centavos = aCentavos(monto_total, MONTO_MAXIMO_OBLIGACION);
+    if (centavos === null) {
+        return res.status(400).json({
+            error: `monto_total debe ser mayor a 0, con máximo 2 decimales y no superar $${MONTO_MAXIMO_OBLIGACION}.`
+        });
+    }
+
+    let fecha = calcularFechaVencimiento();
+    if (fecha_vencimiento) {
+        fecha = parsearFecha(fecha_vencimiento);
+        if (!fecha) {
+            return res.status(400).json({ error: "fecha_vencimiento no es una fecha válida." });
+        }
+        if (fecha < inicioDeHoy()) {
+            return res.status(400).json({ error: "La fecha de vencimiento no puede ser anterior a hoy." });
+        }
     }
 
     try {
-        const fecha = fecha_vencimiento
-            ? new Date(fecha_vencimiento)
-            : calcularFechaVencimiento();
+        const est = await pool.query(
+            `SELECT 1 FROM public.estudiantes WHERE estudiante_id = $1`, [String(estudiante_id)]
+        );
+        if (est.rows.length === 0) {
+            return res.status(404).json({ error: "El estudiante no existe." });
+        }
+
+        if (concepto) {
+            const dup = await pool.query(
+                `SELECT 1 FROM public.cobros_obligaciones
+                 WHERE estudiante_id = $1 AND LOWER(concepto) = LOWER($2)`,
+                [String(estudiante_id), concepto]
+            );
+            if (dup.rows.length > 0) {
+                return res.status(409).json({ error: `El estudiante ya tiene una obligación con el concepto "${concepto}".` });
+            }
+        }
 
         const result = await pool.query(
             `INSERT INTO public.cobros_obligaciones
-                (estudiante_id, fecha_vencimiento, monto_total, monto_pagado, estado)
-             VALUES ($1, $2, $3, 0.00, 'PENDIENTE') RETURNING *`,
-            [estudiante_id, fecha, monto_total]
+                (estudiante_id, fecha_vencimiento, monto_total, monto_base, monto_pagado, estado, concepto, tipo)
+             VALUES ($1, $2, $3, $3, 0.00, 'PENDIENTE', $4, 'OTRO') RETURNING *`,
+            [String(estudiante_id), fecha, centavos / 100, concepto]
         );
         res.status(201).json({
             message: "Obligación creada correctamente.",
@@ -49,13 +98,22 @@ async function crearObligacion(req, res) {
    ═══════════════════════════════════════════════════════════ */
 async function obtenerObligaciones(req, res) {
     try {
+        await aplicarRecargosSiToca(pool);
+
         const result = await pool.query(
-            `SELECT co.*, e.nombre, e.apellido, e.codigo_estudiante
+            `SELECT co.*,
+                    COALESCE(co.monto_base, co.monto_total - co.recargo_acumulado) AS monto_base,
+                    (co.monto_total - co.monto_pagado) AS saldo_pendiente,
+                    ${estadoRealSql("co")} AS estado_real,
+                    e.nombre, e.apellido, e.codigo_estudiante,
+                    p.nombre AS plan_nombre,
+                    (SELECT COUNT(*)::int FROM public.cobros_obligaciones x WHERE x.plan_id = co.plan_id) AS plan_total_cuotas
              FROM public.cobros_obligaciones co
              LEFT JOIN public.estudiantes e ON co.estudiante_id = e.estudiante_id
+             LEFT JOIN public.cobros_planes p ON p.plan_id = co.plan_id
              ORDER BY
                 CASE WHEN co.comprobante_estado = 'PENDIENTE' THEN 0 ELSE 1 END,
-                co.fecha_vencimiento ASC`
+                co.fecha_vencimiento ASC, co.numero_cuota ASC NULLS LAST`
         );
         res.json(result.rows);
     } catch (error) {
@@ -66,92 +124,129 @@ async function obtenerObligaciones(req, res) {
 
 /* ═══════════════════════════════════════════════════════════
    3. PUT /api/cobros/pagar  (Admin)
-   FIX: usa client dedicado para que BEGIN/COMMIT sean en la
-   misma conexión y no en conexiones aleatorias del pool.
    ═══════════════════════════════════════════════════════════ */
 async function registrarPago(req, res) {
-    const { obligacion_id, monto_pago } = req.body;
+    const { obligacion_id, monto_pago, metodo_pago } = req.body;
 
-    if (!obligacion_id || !monto_pago || isNaN(Number(monto_pago)) || Number(monto_pago) <= 0) {
-        return res.status(400).json({ error: "obligacion_id y monto_pago (mayor a 0) son obligatorios." });
+    const centavos = aCentavos(monto_pago, MONTO_MAXIMO_OBLIGACION);
+    if (!obligacion_id) {
+        return res.status(400).json({ error: "obligacion_id es obligatorio." });
+    }
+    if (centavos === null) {
+        return res.status(400).json({
+            error: `monto_pago debe ser mayor a 0, con máximo 2 decimales y no superar $${MONTO_MAXIMO_OBLIGACION}.`
+        });
+    }
+    const metodosValidos = ["EFECTIVO", "TRANSFERENCIA", "DEUNA", "OTRO"];
+    if (metodo_pago && !metodosValidos.includes(metodo_pago)) {
+        return res.status(400).json({ error: `metodo_pago debe ser uno de: ${metodosValidos.join(", ")}.` });
     }
 
-    const client = await pool.connect(); // ← cliente dedicado (FIX)
+    const client = await pool.connect();
     try {
-        const resultado = await aplicarPago(client, obligacion_id, monto_pago);
-        res.json({
-            message: "Pago registrado correctamente.",
-            obligacion: resultado
+        await client.query("BEGIN");
+        const resultado = await aplicarPago(client, obligacion_id, centavos, {
+            usuario: req.user.id, origen: "MANUAL", metodo: metodo_pago || null
         });
+        await client.query("COMMIT");
+        res.json({ message: "Pago registrado correctamente.", obligacion: resultado });
     } catch (error) {
+        try { await client.query("ROLLBACK"); } catch (_) { /* ya en rollback */ }
         if (error.httpStatus) {
             return res.status(error.httpStatus).json({ error: error.message });
         }
         console.error("🔴 registrarPago:", error);
         res.status(500).json({ error: "Error interno al registrar el pago." });
     } finally {
-        client.release(); // ← siempre liberar el cliente
+        client.release();
     }
 }
 
 /**
- * Aplica un pago sobre una obligación dentro de su propia transacción.
- * Reutilizado tanto por registrarPago (pago manual del admin) como por
- * aprobarComprobante (pago derivado de un comprobante subido por el
- * estudiante y aprobado por el admin).
+ * Aplica un pago (en CENTAVOS) sobre una obligación. NO abre ni cierra la transacción:
+ * quien la llama es responsable de BEGIN/COMMIT/ROLLBACK, para que pagar y marcar el
+ * comprobante como aprobado sean una sola operación atómica.
  */
-async function aplicarPago(client, obligacion_id, monto_pago) {
-    await client.query("BEGIN");
+async function aplicarPago(client, obligacion_id, montoCentavos, { usuario = null, origen = "MANUAL", metodo = null, lote = null, recargosAlDia = false } = {}) {
+    // Antes de cobrar, se carga cualquier recargo pendiente de esta cuota para que el saldo sea el real.
+    // (El pago acumulado ya lo hizo para todo el estudiante, por eso puede omitirse con recargosAlDia.)
+    if (!recargosAlDia) {
+        await aplicarRecargos(client, { obligacionId: obligacion_id });
+    }
+
+    const oblRes = await client.query(
+        `SELECT monto_total, monto_pagado, estado
+         FROM public.cobros_obligaciones
+         WHERE obligacion_id = $1 FOR UPDATE`,
+        [obligacion_id]
+    );
+
+    if (oblRes.rows.length === 0) {
+        throw Object.assign(new Error("Obligación no encontrada."), { httpStatus: 404 });
+    }
+
+    const obl = oblRes.rows[0];
+
+    if (obl.estado === "PAGADO") {
+        throw Object.assign(new Error("Esta obligación ya está completamente pagada."), { httpStatus: 400 });
+    }
+
+    // Aritmética en centavos enteros: evita errores de coma flotante con dinero
+    const totalC    = Math.round(parseFloat(obl.monto_total) * 100);
+    const pagadoC   = Math.round(parseFloat(obl.monto_pagado) * 100);
+    const saldoC    = totalC - pagadoC;
+
+    if (montoCentavos > saldoC) {
+        throw Object.assign(
+            new Error(`El monto ($${(montoCentavos / 100).toFixed(2)}) excede el saldo pendiente ($${(saldoC / 100).toFixed(2)}).`),
+            { httpStatus: 400 }
+        );
+    }
+
+    const nuevoPagadoC = pagadoC + montoCentavos;
+    const nuevoEstado  = nuevoPagadoC === totalC ? "PAGADO" : "PARCIAL";
+
+    const updateRes = await client.query(
+        `UPDATE public.cobros_obligaciones
+         SET monto_pagado = $1, estado = $2, fecha_pago = NOW()
+         WHERE obligacion_id = $3 RETURNING *`,
+        [nuevoPagadoC / 100, nuevoEstado, obligacion_id]
+    );
+
+    // Historial: un registro por cada abono
+    await client.query(
+        `INSERT INTO public.cobros_pagos (obligacion_id, monto, registrado_por, origen, metodo_pago, lote)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [obligacion_id, montoCentavos / 100, usuario === null ? null : String(usuario), origen, metodo, lote]
+    );
+
+    return updateRes.rows[0];
+}
+
+/* ═══════════════════════════════════════════════════════════
+   3b. GET /api/cobros/obligaciones/:id/pagos  (Admin)
+   Historial de abonos de una obligación
+   ═══════════════════════════════════════════════════════════ */
+async function obtenerPagosObligacion(req, res) {
     try {
-        const oblRes = await client.query(
-            `SELECT monto_total, monto_pagado, estado
-             FROM public.cobros_obligaciones
-             WHERE obligacion_id = $1 FOR UPDATE`,
-            [obligacion_id]
+        const result = await pool.query(
+            `SELECT pago_id, monto, fecha_pago, origen, metodo_pago, registrado_por
+             FROM public.cobros_pagos
+             WHERE obligacion_id = $1
+             ORDER BY fecha_pago DESC`,
+            [req.params.id]
         );
-
-        if (oblRes.rows.length === 0) {
-            await client.query("ROLLBACK");
-            throw Object.assign(new Error("Obligación no encontrada."), { httpStatus: 404 });
-        }
-
-        const obl = oblRes.rows[0];
-
-        if (obl.estado === "PAGADO") {
-            await client.query("ROLLBACK");
-            throw Object.assign(new Error("Esta obligación ya está completamente pagada."), { httpStatus: 400 });
-        }
-
-        const nuevoMontoPagado = parseFloat(obl.monto_pagado) + parseFloat(monto_pago);
-        const montoPendiente   = parseFloat(obl.monto_total) - nuevoMontoPagado;
-
-        if (montoPendiente < -0.01) {
-            await client.query("ROLLBACK");
-            throw Object.assign(new Error("El monto del pago excede la deuda restante."), { httpStatus: 400 });
-        }
-
-        // FIX de estados: todos en MAYÚSCULAS para coincidir con VISTA_ESTADO_COBROS y CSS
-        const nuevoEstado = montoPendiente <= 0 ? "PAGADO" : "PARCIAL";
-
-        const updateRes = await client.query(
-            `UPDATE public.cobros_obligaciones
-             SET monto_pagado = $1,
-                 estado = $2,
-                 fecha_pago = NOW()
-             WHERE obligacion_id = $3 RETURNING *`,
-            [nuevoMontoPagado, nuevoEstado, obligacion_id]
-        );
-
-        await client.query("COMMIT");
-        return updateRes.rows[0];
+        res.json(result.rows);
     } catch (error) {
-        try { await client.query("ROLLBACK"); } catch (_) { /* ya en rollback */ }
-        throw error;
+        console.error("🔴 obtenerPagosObligacion:", error);
+        res.status(500).json({ error: "Error al obtener el historial de pagos." });
     }
 }
 
 /* ═══════════════════════════════════════════════════════════
    4. POST /api/cobros/obligaciones/importar-excel  (Admin)
+   Columnas: estudiante_id, monto_total, fecha_vencimiento (opcional), concepto (opcional)
+   Cada fila va en su propio SAVEPOINT: una fila con error NO invalida las demás.
    ═══════════════════════════════════════════════════════════ */
 async function importarObligacionesExcel(req, res) {
     if (!req.file) {
@@ -160,7 +255,8 @@ async function importarObligacionesExcel(req, res) {
 
     let filas;
     try {
-        const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+        // cellDates: las fechas de Excel llegan como Date (antes llegaban como número serial → año 1900)
+        const workbook = XLSX.read(req.file.buffer, { type: "buffer", cellDates: true });
         const hoja = workbook.SheetNames[0];
         filas = XLSX.utils.sheet_to_json(workbook.Sheets[hoja], { defval: null });
     } catch {
@@ -170,6 +266,9 @@ async function importarObligacionesExcel(req, res) {
     if (filas.length === 0) {
         return res.status(400).json({ error: "El archivo no contiene filas de datos." });
     }
+    if (filas.length > MAX_FILAS_EXCEL) {
+        return res.status(400).json({ error: `El archivo supera el máximo de ${MAX_FILAS_EXCEL} filas por importación.` });
+    }
 
     const insertadas = [];
     const errores    = [];
@@ -177,6 +276,7 @@ async function importarObligacionesExcel(req, res) {
 
     try {
         await client.query("BEGIN");
+        const hoy = inicioDeHoy();
 
         for (let i = 0; i < filas.length; i++) {
             const fila       = filas[i];
@@ -187,35 +287,79 @@ async function importarObligacionesExcel(req, res) {
                 return acc;
             }, {});
 
-            const estudiante_id       = claves["estudiante_id"];
-            const monto_total         = claves["monto_total"];
-            const fecha_vencimiento_r = claves["fecha_vencimiento"];
+            const estudiante_id = claves["estudiante_id"] !== null && claves["estudiante_id"] !== undefined
+                ? String(claves["estudiante_id"]).trim() : "";
+            const concepto = claves["concepto"] ? String(claves["concepto"]).trim().slice(0, 120) : null;
 
-            if (!estudiante_id || monto_total === null || isNaN(Number(monto_total))) {
-                errores.push({ fila: numeroFila, motivo: "estudiante_id o monto_total faltante/inválido." });
+            if (!estudiante_id) {
+                errores.push({ fila: numeroFila, motivo: "estudiante_id faltante." });
                 continue;
             }
 
-            const fecha = fecha_vencimiento_r
-                ? new Date(fecha_vencimiento_r)
-                : calcularFechaVencimiento();
+            const centavos = aCentavos(claves["monto_total"], MONTO_MAXIMO_OBLIGACION);
+            if (centavos === null) {
+                errores.push({
+                    fila: numeroFila,
+                    motivo: `monto_total inválido (debe ser > 0, máx. 2 decimales y ≤ $${MONTO_MAXIMO_OBLIGACION}).`
+                });
+                continue;
+            }
 
+            let fecha = calcularFechaVencimiento();
+            if (claves["fecha_vencimiento"]) {
+                fecha = parsearFecha(claves["fecha_vencimiento"]);
+                if (!fecha) {
+                    errores.push({ fila: numeroFila, motivo: "fecha_vencimiento no es una fecha válida." });
+                    continue;
+                }
+                if (fecha < hoy) {
+                    errores.push({ fila: numeroFila, motivo: "fecha_vencimiento anterior a hoy." });
+                    continue;
+                }
+            }
+
+            await client.query("SAVEPOINT fila_import");
             try {
+                const est = await client.query(
+                    `SELECT 1 FROM public.estudiantes WHERE estudiante_id = $1`, [estudiante_id]
+                );
+                if (est.rows.length === 0) {
+                    await client.query("ROLLBACK TO SAVEPOINT fila_import");
+                    errores.push({ fila: numeroFila, motivo: `El estudiante ${estudiante_id} no existe.` });
+                    continue;
+                }
+
+                if (concepto) {
+                    const dup = await client.query(
+                        `SELECT 1 FROM public.cobros_obligaciones
+                         WHERE estudiante_id = $1 AND LOWER(concepto) = LOWER($2)`,
+                        [estudiante_id, concepto]
+                    );
+                    if (dup.rows.length > 0) {
+                        await client.query("ROLLBACK TO SAVEPOINT fila_import");
+                        errores.push({ fila: numeroFila, motivo: `Ya existe una obligación "${concepto}" para ese estudiante.` });
+                        continue;
+                    }
+                }
+
                 const r = await client.query(
                     `INSERT INTO public.cobros_obligaciones
-                        (estudiante_id, fecha_vencimiento, monto_total, monto_pagado, estado)
-                     VALUES ($1, $2, $3, 0.00, 'PENDIENTE') RETURNING *`,
-                    [String(estudiante_id), fecha, Number(monto_total)]
+                        (estudiante_id, fecha_vencimiento, monto_total, monto_base, monto_pagado, estado, concepto, tipo)
+                     VALUES ($1, $2, $3, $3, 0.00, 'PENDIENTE', $4, 'OTRO') RETURNING *`,
+                    [estudiante_id, fecha, centavos / 100, concepto]
                 );
+                await client.query("RELEASE SAVEPOINT fila_import");
                 insertadas.push(r.rows[0]);
             } catch (e) {
-                errores.push({ fila: numeroFila, motivo: e.message });
+                await client.query("ROLLBACK TO SAVEPOINT fila_import");
+                errores.push({ fila: numeroFila, motivo: "Error al guardar la fila." });
+                console.error(`🔴 importarExcel fila ${numeroFila}:`, e.message);
             }
         }
 
         await client.query("COMMIT");
     } catch (error) {
-        await client.query("ROLLBACK");
+        try { await client.query("ROLLBACK"); } catch (_) { /* noop */ }
         console.error("🔴 importarExcel:", error);
         return res.status(500).json({ error: "Error interno durante la importación." });
     } finally {
@@ -235,10 +379,17 @@ async function importarObligacionesExcel(req, res) {
    ═══════════════════════════════════════════════════════════ */
 async function obtenerMisObligaciones(req, res) {
     try {
+        await aplicarRecargosSiToca(pool);
         const result = await pool.query(
             `SELECT
                 obligacion_id,
                 fecha_vencimiento,
+                concepto,
+                tipo,
+                numero_cuota,
+                plan_id,
+                COALESCE(monto_base, monto_total - recargo_acumulado) AS monto_base,
+                recargo_acumulado,
                 monto_total,
                 monto_pagado,
                 (monto_total - monto_pagado) AS saldo_pendiente,
@@ -251,7 +402,7 @@ async function obtenerMisObligaciones(req, res) {
                 comprobante_observacion
              FROM public.cobros_obligaciones
              WHERE estudiante_id = $1
-             ORDER BY fecha_vencimiento ASC`,
+             ORDER BY fecha_vencimiento ASC, numero_cuota ASC NULLS LAST`,
             [req.user.id]
         );
         res.json(result.rows);
@@ -275,14 +426,16 @@ async function subirComprobante(req, res) {
     if (!req.file) {
         return res.status(400).json({ error: "Debes adjuntar el comprobante (imagen o PDF)." });
     }
-    if (!monto_declarado || isNaN(Number(monto_declarado)) || Number(monto_declarado) <= 0) {
-        return res.status(400).json({ error: "monto_declarado debe ser un número mayor a 0." });
+    const declaradoC = aCentavos(monto_declarado, MONTO_MAXIMO_OBLIGACION);
+    if (declaradoC === null) {
+        return res.status(400).json({ error: "monto_declarado debe ser mayor a 0 y tener máximo 2 decimales." });
     }
 
     try {
         // Solo puede subir comprobante de una obligación que le pertenece a él mismo
         const obligacion = await pool.query(
-            `SELECT estudiante_id, estado FROM public.cobros_obligaciones WHERE obligacion_id = $1`,
+            `SELECT estudiante_id, estado, monto_total, monto_pagado, comprobante_estado
+             FROM public.cobros_obligaciones WHERE obligacion_id = $1`,
             [id]
         );
         if (obligacion.rows.length === 0) {
@@ -293,6 +446,17 @@ async function subirComprobante(req, res) {
         }
         if (obligacion.rows[0].estado === "PAGADO") {
             return res.status(400).json({ error: "Esta obligación ya está completamente pagada." });
+        }
+        // No sobrescribir un comprobante que el admin todavía no revisó (se perdería el anterior)
+        if (obligacion.rows[0].comprobante_estado === "PENDIENTE") {
+            return res.status(409).json({ error: "Ya tienes un comprobante en revisión para esta obligación. Espera la respuesta del administrador." });
+        }
+        const saldoC = Math.round(parseFloat(obligacion.rows[0].monto_total) * 100)
+                     - Math.round(parseFloat(obligacion.rows[0].monto_pagado) * 100);
+        if (declaradoC > saldoC) {
+            return res.status(400).json({
+                error: `El monto declarado ($${(declaradoC / 100).toFixed(2)}) supera tu saldo pendiente ($${(saldoC / 100).toFixed(2)}).`
+            });
         }
 
         const rutaPublica = `/uploads/comprobantes/${req.file.filename}`;
@@ -305,7 +469,7 @@ async function subirComprobante(req, res) {
                  comprobante_observacion = NULL
              WHERE obligacion_id = $3
              RETURNING *`,
-            [rutaPublica, monto_declarado, id]
+            [rutaPublica, declaradoC / 100, id]
         );
 
         res.status(201).json({
@@ -328,22 +492,35 @@ async function aprobarComprobante(req, res) {
 
     const client = await pool.connect();
     try {
-        const obligacion = await pool.query(
+        await client.query("BEGIN");
+
+        // FOR UPDATE: dos admins aprobando a la vez no pueden aplicar el mismo comprobante dos veces
+        const obligacion = await client.query(
             `SELECT comprobante_estado, comprobante_monto_declarado
-             FROM public.cobros_obligaciones WHERE obligacion_id = $1`,
+             FROM public.cobros_obligaciones WHERE obligacion_id = $1 FOR UPDATE`,
             [id]
         );
         if (obligacion.rows.length === 0) {
+            await client.query("ROLLBACK");
             return res.status(404).json({ error: "Obligación no encontrada." });
         }
         if (obligacion.rows[0].comprobante_estado !== "PENDIENTE") {
+            await client.query("ROLLBACK");
             return res.status(400).json({ error: "Esta obligación no tiene un comprobante pendiente de revisión." });
         }
 
         const montoAplicar = obligacion.rows[0].comprobante_monto_declarado;
-        const actualizada = await aplicarPago(client, id, montoAplicar);
+        const centavos = aCentavos(montoAplicar, MONTO_MAXIMO_OBLIGACION);
+        if (centavos === null) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ error: "El monto declarado del comprobante no es válido." });
+        }
 
-        const resultado = await pool.query(
+        await aplicarPago(client, id, centavos, {
+            usuario: req.user.id, origen: "COMPROBANTE", metodo: "TRANSFERENCIA"
+        });
+
+        const resultado = await client.query(
             `UPDATE public.cobros_obligaciones
              SET comprobante_estado = 'APROBADO'
              WHERE obligacion_id = $1
@@ -351,11 +528,14 @@ async function aprobarComprobante(req, res) {
             [id]
         );
 
+        await client.query("COMMIT");
+
         res.json({
-            message: `Comprobante aprobado. Se aplicó un pago de $${montoAplicar}.`,
-            obligacion: resultado.rows[0] || actualizada
+            message: `Comprobante aprobado. Se aplicó un pago de $${(centavos / 100).toFixed(2)}.`,
+            obligacion: resultado.rows[0]
         });
     } catch (error) {
+        try { await client.query("ROLLBACK"); } catch (_) { /* ya en rollback */ }
         if (error.httpStatus) {
             return res.status(error.httpStatus).json({ error: error.message });
         }
@@ -371,7 +551,7 @@ async function aprobarComprobante(req, res) {
    ═══════════════════════════════════════════════════════════ */
 async function rechazarComprobante(req, res) {
     const { id } = req.params;
-    const { observacion } = req.body;
+    const observacion = req.body.observacion ? String(req.body.observacion).trim().slice(0, 300) : null;
 
     try {
         const result = await pool.query(
@@ -399,6 +579,8 @@ async function rechazarComprobante(req, res) {
    ═══════════════════════════════════════════════════════════ */
 async function obtenerResumenFinanciero(req, res) {
     try {
+        await aplicarRecargosSiToca(pool);
+
         const result = await pool.query(`
             SELECT
                 COALESCE(SUM(monto_pagado), 0)::numeric(10,2)                        AS total_recaudado,
@@ -406,8 +588,19 @@ async function obtenerResumenFinanciero(req, res) {
                 COUNT(*) FILTER (WHERE estado IN ('PENDIENTE','PARCIAL'))::int         AS obligaciones_pendientes,
                 COUNT(DISTINCT estudiante_id) FILTER (
                     WHERE estado IN ('PENDIENTE','PARCIAL')
-                    AND   fecha_vencimiento < NOW()
+                    AND   fecha_vencimiento::date < CURRENT_DATE
                 )::int                                                                 AS estudiantes_morosos,
+                COALESCE(SUM(monto_total - monto_pagado) FILTER (
+                    WHERE estado <> 'PAGADO' AND fecha_vencimiento::date < CURRENT_DATE
+                ), 0)::numeric(10,2)                                                   AS total_vencido,
+                COUNT(*) FILTER (
+                    WHERE estado <> 'PAGADO' AND fecha_vencimiento::date < CURRENT_DATE
+                )::int                                                                 AS cuotas_vencidas,
+                COALESCE(SUM(recargo_acumulado), 0)::numeric(10,2)                     AS total_recargos,
+                COALESCE(SUM(monto_total - monto_pagado) FILTER (
+                    WHERE estado <> 'PAGADO'
+                    AND fecha_vencimiento::date BETWEEN CURRENT_DATE AND CURRENT_DATE + 30
+                ), 0)::numeric(10,2)                                                   AS por_vencer_30d,
                 CASE
                     WHEN SUM(monto_total) > 0
                     THEN ROUND(SUM(monto_pagado) / SUM(monto_total) * 100, 1)
@@ -418,15 +611,16 @@ async function obtenerResumenFinanciero(req, res) {
 
         const pagos = await pool.query(`
             SELECT
-                co.obligacion_id,
-                co.fecha_pago,
-                co.monto_pagado AS monto,
+                p.pago_id,
+                p.obligacion_id,
+                p.fecha_pago,
+                p.monto,
                 e.nombre || ' ' || e.apellido AS estudiante,
                 e.codigo_estudiante
-            FROM public.cobros_obligaciones co
+            FROM public.cobros_pagos p
+            JOIN public.cobros_obligaciones co ON co.obligacion_id = p.obligacion_id
             JOIN public.estudiantes e ON co.estudiante_id = e.estudiante_id
-            WHERE co.fecha_pago IS NOT NULL
-            ORDER BY co.fecha_pago DESC
+            ORDER BY p.fecha_pago DESC
             LIMIT 10
         `);
 
@@ -444,6 +638,8 @@ module.exports = {
     crearObligacion,
     obtenerObligaciones,
     registrarPago,
+    aplicarPago,
+    obtenerPagosObligacion,
     importarObligacionesExcel,
     obtenerMisObligaciones,
     obtenerResumenFinanciero,

@@ -1,18 +1,48 @@
 const pool = require("../db");
 const bcrypt = require("bcrypt");
+const { normalizarEmail, emailValido, cedulaEcuatorianaValida, contrasenaValida } = require("../utils/validaciones");
+
+const ROLES_VALIDOS = [1, 2, 3];
 
 // 1. Crear Usuario (solo Admin)
 async function crearUsuario(req, res) {
-    const { usuario_id, nombre_completo, email, contrasena, rol_id, activo, titulacion_id } = req.body;
+    const { usuario_id, nombre_completo, contrasena, rol_id, activo, titulacion_id } = req.body;
+    const email = normalizarEmail(req.body.email);
 
     if (!usuario_id || !nombre_completo || !email || !contrasena || !rol_id) {
         return res.status(400).json({
             error: "usuario_id, nombre_completo, email, contrasena y rol_id son obligatorios."
         });
     }
+    if (!cedulaEcuatorianaValida(usuario_id)) {
+        return res.status(400).json({ error: "La cédula / ID no es una cédula ecuatoriana válida." });
+    }
+    if (String(nombre_completo).trim().length < 3 || String(nombre_completo).length > 100) {
+        return res.status(400).json({ error: "El nombre completo debe tener entre 3 y 100 caracteres." });
+    }
+    if (!emailValido(email)) {
+        return res.status(400).json({ error: "El correo electrónico no es válido." });
+    }
+    if (!contrasenaValida(contrasena)) {
+        return res.status(400).json({ error: "La contraseña debe tener mínimo 8 caracteres, con letras y números." });
+    }
+    if (!ROLES_VALIDOS.includes(Number(rol_id))) {
+        return res.status(400).json({ error: "rol_id debe ser 1 (Administrador), 2 (Docente) o 3 (Estudiante)." });
+    }
 
     const client = await pool.connect();
     try {
+        // Si es estudiante, la titulación debe existir (antes se asumía la 1 a ciegas)
+        if (Number(rol_id) === 3) {
+            if (!titulacion_id) {
+                return res.status(400).json({ error: "Selecciona la titulación del estudiante." });
+            }
+            const t = await client.query(`SELECT 1 FROM public.titulaciones WHERE titulacion_id = $1`, [titulacion_id]);
+            if (t.rows.length === 0) {
+                return res.status(400).json({ error: "La titulación seleccionada no existe." });
+            }
+        }
+
         await client.query("BEGIN");
 
         const contrasenaHash = await bcrypt.hash(contrasena, 10);
@@ -30,16 +60,16 @@ async function crearUsuario(req, res) {
         // (igual que en el autorregistro). La titulación por defecto se podrá elegir
         // correctamente cuando construyamos el módulo de Titulaciones.
         if (Number(rol_id) === 3) {
-            const partes = nombre_completo.trim().split(" ");
+            const partes = nombre_completo.trim().split(/\s+/);
             const nombre = partes[0];
             const apellido = partes.slice(1).join(" ") || " ";
-            const codigoEstudiante = `EST-${Date.now().toString().slice(-5)}`;
+            const codigoEstudiante = `EST-${Date.now().toString().slice(-5)}${Math.floor(Math.random() * 90 + 10)}`;
 
             await client.query(
                 `INSERT INTO public.estudiantes
-                    (estudiante_id, nombre, apellido, email, titulacion_id, fecha_ingreso, codigo_estudiante)
-                 VALUES ($1, $2, $3, $4, $5, NOW(), $6)`,
-                [usuario_id, nombre, apellido, email, titulacion_id || 1, codigoEstudiante]
+                    (estudiante_id, usuario_id, nombre, apellido, email, titulacion_id, fecha_ingreso, codigo_estudiante, cedula)
+                 VALUES ($1, $1, $2, $3, $4, $5, NOW(), $6, $1)`,
+                [usuario_id, nombre, apellido, email, titulacion_id, codigoEstudiante]
             );
 
             mensajeExtra = ` Se generó también su ficha de estudiante (código ${codigoEstudiante}).`;
@@ -55,8 +85,12 @@ async function crearUsuario(req, res) {
     } catch (error) {
         await client.query("ROLLBACK");
         if (error.code === "23505") {
-            if (error.detail && error.detail.toLowerCase().includes("email")) {
+            const detalle = (error.detail || "").toLowerCase();
+            if (detalle.includes("email")) {
                 return res.status(409).json({ error: "Ya existe un usuario con ese correo electrónico." });
+            }
+            if (detalle.includes("codigo")) {
+                return res.status(409).json({ error: "Código de estudiante repetido, intenta de nuevo." });
             }
             return res.status(409).json({ error: "Ya existe un usuario registrado con esa cédula / ID." });
         }
@@ -113,47 +147,72 @@ async function obtenerUsuarioPorId(req, res) {
 // 4. Actualizar Usuario
 async function actualizarUsuario(req, res) {
     const { id } = req.params;
-    const { nombre_completo, email, rol_id, activo, contrasena } = req.body;
+    const { nombre_completo, rol_id, activo, contrasena } = req.body;
+    const email = normalizarEmail(req.body.email);
+
+    if (!nombre_completo || String(nombre_completo).trim().length < 3 || !email || !rol_id) {
+        return res.status(400).json({ error: "nombre_completo, email y rol_id son obligatorios." });
+    }
+    if (!emailValido(email)) {
+        return res.status(400).json({ error: "El correo electrónico no es válido." });
+    }
+    if (!ROLES_VALIDOS.includes(Number(rol_id))) {
+        return res.status(400).json({ error: "rol_id debe ser 1, 2 o 3." });
+    }
+    if (contrasena && contrasena.trim() !== "" && !contrasenaValida(contrasena)) {
+        return res.status(400).json({ error: "La contraseña debe tener mínimo 8 caracteres, con letras y números." });
+    }
+    const activoFinal = typeof activo === "boolean" ? activo : (activo === undefined ? true : String(activo) === "true");
+
+    // Un admin no puede quitarse a sí mismo el acceso (quedaría el sistema sin administrador)
+    if (String(id) === String(req.user.id) && (Number(rol_id) !== 1 || activoFinal === false)) {
+        return res.status(400).json({ error: "No puedes quitarte el rol de administrador ni desactivar tu propia cuenta." });
+    }
 
     try {
-        let result;
+        const actual = await pool.query(`SELECT rol_id FROM public.usuarios WHERE usuario_id = $1`, [id]);
+        if (actual.rows.length === 0) {
+            return res.status(404).json({ error: "Usuario no encontrado." });
+        }
+        // Cambiar el rol de/hacia estudiante dejaría la ficha de estudiantes desincronizada
+        if (Number(actual.rows[0].rol_id) !== Number(rol_id) &&
+            (Number(actual.rows[0].rol_id) === 3 || Number(rol_id) === 3)) {
+            return res.status(400).json({
+                error: "No se puede cambiar el rol hacia/desde Estudiante. Crea un usuario nuevo con el rol correcto."
+            });
+        }
 
+        let result;
         if (contrasena && contrasena.trim() !== "") {
-            // Se incluyó una nueva contraseña: también se actualiza el hash
             const contrasenaHash = await bcrypt.hash(contrasena, 10);
             result = await pool.query(
                 `UPDATE public.usuarios
-                 SET nombre_completo = $1,
-                     email = $2,
-                     rol_id = $3,
-                     activo = $4,
-                     contrasena_hash = $5
+                 SET nombre_completo = $1, email = $2, rol_id = $3, activo = $4, contrasena_hash = $5
                  WHERE usuario_id = $6
                  RETURNING usuario_id, nombre_completo, email, rol_id, activo`,
-                [nombre_completo, email, rol_id, activo, contrasenaHash, id]
+                [nombre_completo.trim(), email, rol_id, activoFinal, contrasenaHash, id]
             );
         } else {
             result = await pool.query(
                 `UPDATE public.usuarios
-                 SET nombre_completo = $1,
-                     email = $2,
-                     rol_id = $3,
-                     activo = $4
+                 SET nombre_completo = $1, email = $2, rol_id = $3, activo = $4
                  WHERE usuario_id = $5
                  RETURNING usuario_id, nombre_completo, email, rol_id, activo`,
-                [nombre_completo, email, rol_id, activo, id]
+                [nombre_completo.trim(), email, rol_id, activoFinal, id]
             );
         }
 
-        if (result.rows.length === 0)
-            return res.status(404).json({ error: "Usuario no encontrado." });
+        // Mantener sincronizado el correo de la ficha de estudiante
+        if (Number(rol_id) === 3) {
+            await pool.query(`UPDATE public.estudiantes SET email = $1 WHERE estudiante_id = $2`, [email, id]);
+        }
 
-        res.json({
-            message: "Usuario actualizado correctamente.",
-            usuario: result.rows[0]
-        });
+        res.json({ message: "Usuario actualizado correctamente.", usuario: result.rows[0] });
 
     } catch (error) {
+        if (error.code === "23505") {
+            return res.status(409).json({ error: "Ya existe otro usuario con ese correo electrónico." });
+        }
         console.error("🔴 Error al actualizar usuario:", error);
         res.status(500).json({ error: "Error interno al actualizar el usuario." });
     }
@@ -163,6 +222,10 @@ async function actualizarUsuario(req, res) {
 // 5. Eliminar Usuario (baja lógica: activo = false)
 async function desactivarUsuario(req, res) {
     const { id } = req.params;
+
+    if (String(id) === String(req.user.id)) {
+        return res.status(400).json({ error: "No puedes desactivar tu propia cuenta." });
+    }
 
     try {
         const result = await pool.query(

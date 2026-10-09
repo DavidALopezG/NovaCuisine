@@ -1,5 +1,36 @@
 // src/controllers/horariosControllers.js
 const pool = require("../db");
+const { esHoraValida, DIAS_VALIDOS } = require("../utils/validaciones");
+
+/**
+ * Validaciones de formato y de referencias comunes a crear/editar un bloque.
+ * Devuelve un mensaje de error (string) o null si todo está bien.
+ */
+const normalizarHora = (h) => (typeof h === "string" && /^\d{2}:\d{2}$/.test(h) ? `${h}:00` : h);
+
+async function validarDatosHorario({ asignatura_id, dia_semana, hora_inicio, hora_fin, docente_id }) {
+    if (!DIAS_VALIDOS.includes(dia_semana)) {
+        return `dia_semana debe ser uno de: ${DIAS_VALIDOS.join(", ")}.`;
+    }
+    if (!esHoraValida(hora_inicio) || !esHoraValida(hora_fin)) {
+        return "hora_inicio y hora_fin deben tener formato HH:MM (24 h).";
+    }
+    // Se normaliza a HH:MM:SS para comparar bien como texto ("9:00" > "10:00" ya no es posible)
+    const asig = await pool.query(`SELECT 1 FROM public.asignaturas WHERE asignatura_id = $1`, [asignatura_id]);
+    if (asig.rows.length === 0) {
+        return "La asignatura seleccionada no existe.";
+    }
+    if (docente_id) {
+        const doc = await pool.query(
+            `SELECT rol_id, activo FROM public.usuarios WHERE usuario_id = $1`,
+            [docente_id]
+        );
+        if (doc.rows.length === 0) return "El docente seleccionado no existe.";
+        if (Number(doc.rows[0].rol_id) !== 2) return "El usuario seleccionado no tiene rol de Docente.";
+        if (doc.rows[0].activo === false) return "El docente seleccionado está desactivado.";
+    }
+    return null;
+}
 
 /**
  * Valida hora_fin > hora_inicio y que no exista un choque de horario:
@@ -21,8 +52,8 @@ async function validarHorarioSinConflicto({ dia_semana, hora_inicio, hora_fin, d
         condicionesChoque.push(`docente_id = $${params.length}`);
     }
     if (aula) {
-        params.push(aula);
-        condicionesChoque.push(`aula = $${params.length}`);
+        params.push(String(aula).trim().toLowerCase());
+        condicionesChoque.push(`LOWER(TRIM(aula)) = $${params.length}`);
     }
     if (condicionesChoque.length === 0) {
         return null; // Sin docente ni aula asignados todavía, no hay contra qué comparar
@@ -47,8 +78,10 @@ async function validarHorarioSinConflicto({ dia_semana, hora_inicio, hora_fin, d
    Crea un bloque de horario para una asignatura
    ============================================================ */
 async function crearHorario(req, res) {
-    const { asignatura_id, dia_semana, hora_inicio, hora_fin, aula } = req.body;
+    const { asignatura_id, dia_semana, aula } = req.body;
     let { docente_id, modalidad } = req.body;
+    const hora_inicio = normalizarHora(req.body.hora_inicio);
+    const hora_fin    = normalizarHora(req.body.hora_fin);
 
     if (!asignatura_id || !dia_semana || !hora_inicio || !hora_fin) {
         return res.status(400).json({
@@ -66,18 +99,23 @@ async function crearHorario(req, res) {
         docente_id = req.user.id;
     }
 
-    const errorConflicto = await validarHorarioSinConflicto({ dia_semana, hora_inicio, hora_fin, docente_id, aula });
-    if (errorConflicto) {
-        return res.status(409).json({ error: errorConflicto });
-    }
-
     try {
+        const errorDatos = await validarDatosHorario({ asignatura_id, dia_semana, hora_inicio, hora_fin, docente_id });
+        if (errorDatos) {
+            return res.status(400).json({ error: errorDatos });
+        }
+
+        const errorConflicto = await validarHorarioSinConflicto({ dia_semana, hora_inicio, hora_fin, docente_id, aula });
+        if (errorConflicto) {
+            return res.status(409).json({ error: errorConflicto });
+        }
+
         const result = await pool.query(
             `INSERT INTO public.horarios_clase
                 (asignatura_id, docente_id, dia_semana, hora_inicio, hora_fin, aula, modalidad)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING *`,
-            [asignatura_id, docente_id || null, dia_semana, hora_inicio, hora_fin, aula || null, modalidad]
+            [asignatura_id, docente_id || null, dia_semana, hora_inicio, hora_fin, aula ? String(aula).trim() : null, modalidad]
         );
 
         res.status(201).json({ message: "Horario creado correctamente.", horario: result.rows[0] });
@@ -140,6 +178,16 @@ async function eliminarHorario(req, res) {
             return res.status(403).json({ error: "No puedes eliminar un grupo/horario que no te pertenece." });
         }
 
+        const matriculas = await pool.query(
+            `SELECT COUNT(*)::int AS total FROM public.matriculas_horario WHERE horario_id = $1`,
+            [id]
+        );
+        if (matriculas.rows[0].total > 0) {
+            return res.status(409).json({
+                error: `No se puede eliminar: el grupo tiene ${matriculas.rows[0].total} estudiante(s) matriculado(s). Retíralos primero.`
+            });
+        }
+
         const result = await pool.query(
             `DELETE FROM public.horarios_clase WHERE horario_id = $1 RETURNING *`,
             [id]
@@ -147,6 +195,9 @@ async function eliminarHorario(req, res) {
 
         res.json({ message: "Horario eliminado.", horario: result.rows[0] });
     } catch (error) {
+        if (error.code === "23503") {
+            return res.status(409).json({ error: "No se puede eliminar: el grupo tiene registros vinculados." });
+        }
         console.error("🔴 Error al eliminar horario:", error);
         res.status(500).json({ error: "Error interno al eliminar el horario." });
     }
@@ -161,8 +212,10 @@ async function eliminarHorario(req, res) {
    ============================================================ */
 async function actualizarHorario(req, res) {
     const { id } = req.params;
-    const { asignatura_id, dia_semana, hora_inicio, hora_fin, aula } = req.body;
+    const { asignatura_id, dia_semana, aula } = req.body;
     let { docente_id, modalidad } = req.body;
+    const hora_inicio = normalizarHora(req.body.hora_inicio);
+    const hora_fin    = normalizarHora(req.body.hora_fin);
 
     if (!asignatura_id || !dia_semana || !hora_inicio || !hora_fin) {
         return res.status(400).json({
@@ -194,14 +247,48 @@ async function actualizarHorario(req, res) {
 
         modalidad = modalidad || existente.rows[0].modalidad || "Presencial";
 
+        const docenteFinal = docente_id || existente.rows[0].docente_id;
+
+        const errorDatos = await validarDatosHorario({
+            asignatura_id, dia_semana, hora_inicio, hora_fin, docente_id: docenteFinal
+        });
+        if (errorDatos) {
+            return res.status(400).json({ error: errorDatos });
+        }
+
         const errorConflicto = await validarHorarioSinConflicto({
             dia_semana, hora_inicio, hora_fin,
-            docente_id: docente_id || existente.rows[0].docente_id,
+            docente_id: docenteFinal,
             aula,
             excluirHorarioId: id
         });
         if (errorConflicto) {
             return res.status(409).json({ error: errorConflicto });
+        }
+
+        // Si cambian día/hora, los alumnos ya matriculados podrían quedar con cruces en su propio horario
+        if (!req.body.forzar) {
+            const matriculados = await pool.query(
+                `SELECT m.estudiante_id, e.nombre, e.apellido
+                 FROM public.matriculas_horario m
+                 JOIN public.estudiantes e ON e.estudiante_id = m.estudiante_id
+                 WHERE m.horario_id = $1`,
+                [id]
+            );
+            const afectados = [];
+            for (const est of matriculados.rows) {
+                const cruces = await buscarConflictoHorarioEstudiante(pool, est.estudiante_id, {
+                    horario_id: Number(id), dia_semana, hora_inicio, hora_fin
+                });
+                if (cruces.length > 0) afectados.push(`${est.nombre} ${est.apellido}`);
+            }
+            if (afectados.length > 0) {
+                return res.status(409).json({
+                    error: `Con este cambio ${afectados.length} estudiante(s) matriculado(s) tendrían cruce de horario: ${afectados.slice(0, 5).join(", ")}${afectados.length > 5 ? "…" : ""}.`,
+                    tipo: "CRUCE_HORARIO_MATRICULADOS",
+                    afectados
+                });
+            }
         }
 
         const result = await pool.query(
@@ -215,7 +302,7 @@ async function actualizarHorario(req, res) {
                     modalidad     = $7
               WHERE horario_id = $8
               RETURNING *`,
-            [asignatura_id, docente_id || existente.rows[0].docente_id, dia_semana, hora_inicio, hora_fin, aula || null, modalidad, id]
+            [asignatura_id, docenteFinal, dia_semana, hora_inicio, hora_fin, aula ? String(aula).trim() : null, modalidad, id]
         );
 
         res.json({ message: "Grupo/horario actualizado correctamente.", horario: result.rows[0] });
@@ -375,6 +462,40 @@ async function matricularEstudiante(req, res) {
             return res.status(200).json({
                 message: "El estudiante ya estaba matriculado en este grupo.",
                 matricula: null
+            });
+        }
+
+        // El estudiante debe existir y tener la cuenta activa
+        const est = await client.query(
+            `SELECT e.titulacion_id, COALESCE(u.activo, true) AS activo
+             FROM public.estudiantes e
+             LEFT JOIN public.usuarios u ON u.usuario_id = e.estudiante_id
+             WHERE e.estudiante_id = $1`,
+            [estudiante_id]
+        );
+        if (est.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ error: "El estudiante no existe." });
+        }
+        if (est.rows[0].activo === false) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ error: "El estudiante tiene la cuenta desactivada." });
+        }
+
+        // No puede estar en dos grupos de la MISMA asignatura (bloqueo duro)
+        const mismaAsig = await client.query(
+            `SELECT h2.horario_id
+             FROM public.horarios_clase h1
+             JOIN public.horarios_clase h2 ON h2.asignatura_id = h1.asignatura_id AND h2.horario_id <> h1.horario_id
+             JOIN public.matriculas_horario m ON m.horario_id = h2.horario_id AND m.estudiante_id = $2
+             WHERE h1.horario_id = $1`,
+            [id, estudiante_id]
+        );
+        if (mismaAsig.rows.length > 0) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+                error: "El estudiante ya está matriculado en otro grupo de esta misma asignatura.",
+                tipo: "MISMA_ASIGNATURA"
             });
         }
 

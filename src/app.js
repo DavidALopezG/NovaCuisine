@@ -46,3 +46,16 @@ app.use((err, req, res, next) => {
 
 const PORT = 3000;
 app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+
+// Recargos por mora: al arrancar y luego cada 6 horas (idempotente; si está desactivado no hace nada).
+const { aplicarRecargos } = require("./utils/cobrosCore");
+const correrRecargos = async () => {
+  try {
+    const r = await aplicarRecargos();
+    if (r.cuotas > 0) console.log(`💲 Recargos aplicados: ${r.cuotas} cuota(s), $${r.total.toFixed(2)}`);
+  } catch (e) {
+    if (e.code !== "42P01" && e.code !== "42703") console.error("⚠️ Job de recargos:", e.message);
+  }
+};
+setTimeout(correrRecargos, 15 * 1000);
+setInterval(correrRecargos, 6 * 60 * 60 * 1000);

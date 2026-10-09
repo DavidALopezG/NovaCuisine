@@ -1,10 +1,25 @@
 const pool = require("../db");
+const { normalizarEmail, emailValido, cedulaEcuatorianaValida } = require("../utils/validaciones");
+
+/** Verifica formato de email/cédula y que la titulación exista. Devuelve mensaje de error o null. */
+async function validarDatosEstudiante({ email, cedula, titulacion_id, nombre, apellido }) {
+    if (!nombre || String(nombre).trim().length < 2 || !apellido || String(apellido).trim().length < 1) {
+        return "nombre y apellido no pueden estar vacíos.";
+    }
+    if (!emailValido(email)) return "El correo electrónico no es válido.";
+    if (cedula && !cedulaEcuatorianaValida(cedula)) return "La cédula no es una cédula ecuatoriana válida.";
+    if (!titulacion_id) return "Selecciona la titulación del estudiante.";
+    const t = await pool.query(`SELECT 1 FROM public.titulaciones WHERE titulacion_id = $1`, [titulacion_id]);
+    if (t.rows.length === 0) return "La titulación seleccionada no existe.";
+    return null;
+}
 
 // Edad mínima de ingreso según requisitos institucionales
 const EDAD_MINIMA_INGRESO = 16;
 
 function calcularEdad(fechaNacimiento) {
     if (!fechaNacimiento) return null;
+    if (Number.isNaN(new Date(fechaNacimiento).getTime())) return -1;
     const hoy = new Date();
     const nacimiento = new Date(fechaNacimiento);
     let edad = hoy.getFullYear() - nacimiento.getFullYear();
@@ -17,7 +32,8 @@ function calcularEdad(fechaNacimiento) {
 
 // 1. Crear Estudiante
 async function crearEstudiante(req, res) {
-    const { usuario_id, codigo_estudiante, nombre, apellido, email, titulacion_id, cedula, fecha_nacimiento } = req.body;
+    const { usuario_id, codigo_estudiante, nombre, apellido, titulacion_id, cedula, fecha_nacimiento } = req.body;
+    const email = normalizarEmail(req.body.email);
 
     // usuario_id es obligatorio: todo estudiante debe estar vinculado a un usuario
     if (!usuario_id || !nombre || !apellido || !email) {
@@ -28,6 +44,9 @@ async function crearEstudiante(req, res) {
 
     if (fecha_nacimiento) {
         const edad = calcularEdad(fecha_nacimiento);
+        if (edad !== null && (edad < 0 || edad > 100)) {
+            return res.status(400).json({ error: "La fecha de nacimiento no es válida." });
+        }
         if (edad !== null && edad < EDAD_MINIMA_INGRESO) {
             return res.status(400).json({
                 error: `El estudiante debe tener al menos ${EDAD_MINIMA_INGRESO} años para inscribirse (edad calculada: ${edad}).`
@@ -36,6 +55,11 @@ async function crearEstudiante(req, res) {
     }
 
     try {
+        const errorDatos = await validarDatosEstudiante({ email, cedula: cedula || usuario_id, titulacion_id, nombre, apellido });
+        if (errorDatos) {
+            return res.status(400).json({ error: errorDatos });
+        }
+
         const codigo = codigo_estudiante || `EST-${Date.now().toString().slice(-5)}`;
 
         // Por convención del sistema, usuario_id/estudiante_id YA ES la cédula
@@ -48,7 +72,7 @@ async function crearEstudiante(req, res) {
             (estudiante_id, usuario_id, codigo_estudiante, nombre, apellido, email, titulacion_id, cedula, fecha_nacimiento, fecha_ingreso)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
              RETURNING *`,
-            [usuario_id, usuario_id, codigo, nombre, apellido, email, titulacion_id || 1, cedulaFinal, fecha_nacimiento || null]
+            [usuario_id, usuario_id, codigo, String(nombre).trim(), String(apellido).trim(), email, titulacion_id, cedulaFinal, fecha_nacimiento || null]
         );
 
         res.status(201).json({
@@ -90,6 +114,12 @@ async function obtenerEstudiantes(req, res) {
              ORDER BY e.estudiante_id ASC`
         );
 
+        // El Docente necesita listar estudiantes (matricular, asignar recetas) pero NO ver
+        // el saldo adeudado ni la fecha de nacimiento: son datos financieros / personales.
+        if (req.user.rol === 2) {
+            return res.json(result.rows.map(({ saldo_pendiente, fecha_nacimiento, ...resto }) => resto));
+        }
+
         res.json(result.rows);
 
     } catch (error) {
@@ -124,10 +154,14 @@ async function obtenerEstudiantePorId(req, res) {
 // 4. Actualizar Estudiante
 async function actualizarEstudiante(req, res) {
     const { id } = req.params;
-    const { codigo_estudiante, nombre, apellido, email, titulacion_id, cedula, fecha_nacimiento } = req.body;
+    const { codigo_estudiante, nombre, apellido, titulacion_id, cedula, fecha_nacimiento } = req.body;
+    const email = normalizarEmail(req.body.email);
 
     if (fecha_nacimiento) {
         const edad = calcularEdad(fecha_nacimiento);
+        if (edad !== null && (edad < 0 || edad > 100)) {
+            return res.status(400).json({ error: "La fecha de nacimiento no es válida." });
+        }
         if (edad !== null && edad < EDAD_MINIMA_INGRESO) {
             return res.status(400).json({
                 error: `El estudiante debe tener al menos ${EDAD_MINIMA_INGRESO} años (edad calculada: ${edad}).`
@@ -136,6 +170,11 @@ async function actualizarEstudiante(req, res) {
     }
 
     try {
+        const errorDatos = await validarDatosEstudiante({ email, cedula, titulacion_id, nombre, apellido });
+        if (errorDatos) {
+            return res.status(400).json({ error: errorDatos });
+        }
+
         const result = await pool.query(
             `UPDATE public.estudiantes
              SET codigo_estudiante = $1,
@@ -207,12 +246,17 @@ async function eliminarEstudiante(req, res) {
             `SELECT COUNT(*) FROM public.estudiante_receta_acceso WHERE estudiante_id = $1`, [id]
         );
 
-        const totalCobros  = parseInt(cobros.rows[0].count);
-        const totalRecetas = parseInt(recetas.rows[0].count);
+        const matriculas = await pool.query(
+            `SELECT COUNT(*) FROM public.matriculas_horario WHERE estudiante_id = $1`, [id]
+        );
 
-        if (totalCobros > 0 || totalRecetas > 0) {
+        const totalCobros     = parseInt(cobros.rows[0].count);
+        const totalRecetas    = parseInt(recetas.rows[0].count);
+        const totalMatriculas = parseInt(matriculas.rows[0].count);
+
+        if (totalCobros > 0 || totalRecetas > 0 || totalMatriculas > 0) {
             return res.status(409).json({
-                error: `No se puede eliminar: el estudiante tiene ${totalCobros} cobro(s) y ${totalRecetas} receta(s) asignada(s). Desactiva su cuenta en lugar de eliminarla.`
+                error: `No se puede eliminar: el estudiante tiene ${totalCobros} cobro(s), ${totalRecetas} receta(s) asignada(s) y ${totalMatriculas} matrícula(s) en grupos. Desactiva su cuenta en lugar de eliminarla.`
             });
         }
 

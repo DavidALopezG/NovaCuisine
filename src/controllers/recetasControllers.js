@@ -21,6 +21,37 @@ async function conTransaccion(fn) {
   }
 }
 
+/**
+ * Un Docente solo puede modificar/eliminar/versionar las recetas que él creó.
+ * El Administrador puede con cualquiera. Devuelve { ok: true } o { ok: false, status, error }.
+ */
+async function verificarPropiedadReceta(req, recetaId) {
+  const r = await pool.query(
+    `SELECT usuario_creador_id FROM public.recetas WHERE receta_id = $1`,
+    [recetaId]
+  );
+  if (r.rows.length === 0) {
+    return { ok: false, status: 404, error: "Receta no encontrada." };
+  }
+  if (req.user.rol === 2 && String(r.rows[0].usuario_creador_id) !== String(req.user.id)) {
+    return { ok: false, status: 403, error: "Solo puedes modificar las recetas que tú creaste." };
+  }
+  return { ok: true };
+}
+
+/** Valida nombre / porciones / tiempo de una receta. Devuelve mensaje o null. */
+function validarCamposReceta({ nombre, porciones, tiempo_prep_min }) {
+  const n = String(nombre || "").trim();
+  if (n.length < 3 || n.length > 120) return "El nombre de la receta debe tener entre 3 y 120 caracteres.";
+  const p = Number(porciones);
+  if (!Number.isInteger(p) || p < 1 || p > 500) return "porciones debe ser un entero entre 1 y 500.";
+  if (tiempo_prep_min !== undefined && tiempo_prep_min !== null && tiempo_prep_min !== "") {
+    const t = Number(tiempo_prep_min);
+    if (!Number.isFinite(t) || t < 0 || t > 1440) return "tiempo_prep_min debe estar entre 0 y 1440 minutos.";
+  }
+  return null;
+}
+
 /* ============================================================
    1. POST /api/recetas
    Crea la ficha maestra + su primera versión (1.0, BORRADOR)
@@ -43,6 +74,10 @@ async function crearReceta(req, res) {
 
   if (!nombre || !porciones) {
     return res.status(400).json({ error: "nombre y porciones son obligatorios." });
+  }
+  const errorCampos = validarCamposReceta({ nombre, porciones, tiempo_prep_min });
+  if (errorCampos) {
+    return res.status(400).json({ error: errorCampos });
   }
 
   try {
@@ -265,7 +300,15 @@ async function actualizarReceta(req, res) {
   const { id } = req.params;
   const { nombre, porciones, tiempo_prep_min, asignatura_id } = req.body;
 
+  const errorCampos = validarCamposReceta({ nombre, porciones, tiempo_prep_min });
+  if (errorCampos) {
+    return res.status(400).json({ error: errorCampos });
+  }
+
   try {
+    const propiedad = await verificarPropiedadReceta(req, id);
+    if (!propiedad.ok) return res.status(propiedad.status).json({ error: propiedad.error });
+
     const result = await pool.query(
       `UPDATE public.recetas
        SET nombre = $1,
@@ -296,6 +339,9 @@ async function eliminarReceta(req, res) {
   const { id } = req.params;
 
   try {
+    const propiedad = await verificarPropiedadReceta(req, id);
+    if (!propiedad.ok) return res.status(propiedad.status).json({ error: propiedad.error });
+
     const eliminado = await conTransaccion(async (client) => {
       const versiones = await client.query(
         `SELECT version_id FROM public.recetas_versiones WHERE receta_id = $1`,
@@ -351,6 +397,9 @@ async function crearVersion(req, res) {
   }
 
   try {
+    const propiedad = await verificarPropiedadReceta(req, id);
+    if (!propiedad.ok) return res.status(propiedad.status).json({ error: propiedad.error });
+
     const resultado = await conTransaccion(async (client) => {
       const versionResult = await client.query(
         `INSERT INTO public.recetas_versiones
@@ -410,21 +459,88 @@ async function crearVersion(req, res) {
 async function aprobarVersion(req, res) {
   const { version_id } = req.params;
 
+  if (!/^\d+$/.test(String(version_id))) {
+    return res.status(400).json({ error: "version_id inválido." });
+  }
+
+  // Error controlado: lleva el código HTTP que debe devolverse
+  const falla = (httpStatus, mensaje) => Object.assign(new Error(mensaje), { httpStatus });
+
   try {
-    const result = await pool.query(
-      `UPDATE public.recetas_versiones
-       SET estado = 'APROBADA'
-       WHERE version_id = $1
-       RETURNING *`,
-      [version_id]
-    );
+    const resultado = await conTransaccion(async (client) => {
+      // FOR UPDATE: dos aprobaciones simultáneas de la misma versión no pueden pisarse
+      const v = await client.query(
+        `SELECT rv.version_id, rv.receta_id, rv.estado, rv.numero_version, r.usuario_creador_id
+           FROM public.recetas_versiones rv
+           JOIN public.recetas r ON r.receta_id = rv.receta_id
+          WHERE rv.version_id = $1
+          FOR UPDATE OF rv`,
+        [version_id]
+      );
+      if (v.rows.length === 0) throw falla(404, "Versión no encontrada.");
+      const version = v.rows[0];
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Versión no encontrada." });
-    }
+      // Un Docente solo aprueba versiones de sus propias recetas; el Admin, cualquiera
+      if (req.user.rol === 2 && String(version.usuario_creador_id) !== String(req.user.id)) {
+        throw falla(403, "Solo puedes aprobar versiones de las recetas que tú creaste.");
+      }
 
-    res.json({ message: "Versión aprobada.", version: result.rows[0] });
+      if (version.estado === "APROBADA") {
+        throw falla(409, `La versión ${version.numero_version} ya está aprobada.`);
+      }
+      if (version.estado !== "BORRADOR") {
+        throw falla(409, `Solo se pueden aprobar versiones en borrador (estado actual: ${version.estado}).`);
+      }
+
+      // No se publica una versión vacía: debe tener al menos un ingrediente
+      const ingredientes = await client.query(
+        `SELECT COUNT(*)::int AS total FROM public.receta_version_insumos WHERE version_id = $1`,
+        [version_id]
+      );
+      if (ingredientes.rows[0].total === 0) {
+        throw falla(400, "La versión no tiene ingredientes. Agrega al menos uno antes de aprobarla.");
+      }
+
+      // Evita que una versión antigua desplace a una más reciente ya aprobada
+      const masReciente = await client.query(
+        `SELECT numero_version FROM public.recetas_versiones
+          WHERE receta_id = $1 AND estado = 'APROBADA' AND version_id > $2
+          LIMIT 1`,
+        [version.receta_id, version_id]
+      );
+      if (masReciente.rows.length > 0) {
+        throw falla(409, `Ya existe una versión aprobada más reciente (${masReciente.rows[0].numero_version}).`);
+      }
+
+      // La versión aprobada anterior de esta receta queda como REEMPLAZADA (historial claro)
+      const reemplazadas = await client.query(
+        `UPDATE public.recetas_versiones
+            SET estado = 'REEMPLAZADA'
+          WHERE receta_id = $1 AND estado = 'APROBADA' AND version_id <> $2`,
+        [version.receta_id, version_id]
+      );
+
+      const aprobada = await client.query(
+        `UPDATE public.recetas_versiones
+            SET estado = 'APROBADA'
+          WHERE version_id = $1
+          RETURNING *`,
+        [version_id]
+      );
+
+      return { version: aprobada.rows[0], reemplazadas: reemplazadas.rowCount };
+    });
+
+    res.json({
+      message: resultado.reemplazadas > 0
+        ? "Versión aprobada. La versión aprobada anterior quedó como reemplazada."
+        : "Versión aprobada.",
+      version: resultado.version
+    });
   } catch (error) {
+    if (error.httpStatus) {
+      return res.status(error.httpStatus).json({ error: error.message });
+    }
     console.error("🔴 Error al aprobar versión:", error);
     res.status(500).json({ error: "Error interno al aprobar la versión." });
   }
@@ -443,6 +559,17 @@ async function asignarReceta(req, res) {
   }
 
   try {
+    const rec = await pool.query(`SELECT 1 FROM public.recetas WHERE receta_id = $1`, [id]);
+    if (rec.rows.length === 0) {
+      return res.status(404).json({ error: "Receta no encontrada." });
+    }
+    const est = await pool.query(
+      `SELECT 1 FROM public.estudiantes WHERE estudiante_id = $1`, [String(estudiante_id)]
+    );
+    if (est.rows.length === 0) {
+      return res.status(404).json({ error: "El estudiante no existe." });
+    }
+
     const result = await pool.query(
       `INSERT INTO public.estudiante_receta_acceso (estudiante_id, receta_id)
        VALUES ($1, $2)
