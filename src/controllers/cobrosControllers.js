@@ -1,7 +1,7 @@
 // src/controllers/cobrosControllers.js
 const pool = require("../db");
 const XLSX = require("xlsx");
-const { aCentavos } = require("../utils/validaciones");
+const { aCentavos, enteroPositivo } = require("../utils/validaciones");
 const { aplicarRecargos, aplicarRecargosSiToca, estadoRealSql } = require("../utils/cobrosCore");
 
 // Tope razonable de una obligación individual (USD). Evita montos absurdos por error de digitación.
@@ -132,6 +132,9 @@ async function registrarPago(req, res) {
     if (!obligacion_id) {
         return res.status(400).json({ error: "obligacion_id es obligatorio." });
     }
+    if (!enteroPositivo(obligacion_id)) {
+        return res.status(400).json({ error: "obligacion_id inválido." });
+    }
     if (centavos === null) {
         return res.status(400).json({
             error: `monto_pago debe ser mayor a 0, con máximo 2 decimales y no superar $${MONTO_MAXIMO_OBLIGACION}.`
@@ -168,6 +171,12 @@ async function registrarPago(req, res) {
  * comprobante como aprobado sean una sola operación atómica.
  */
 async function aplicarPago(client, obligacion_id, montoCentavos, { usuario = null, origen = "MANUAL", metodo = null, lote = null, recargosAlDia = false } = {}) {
+    // Defensa en profundidad: esta función también la usan la aprobación de comprobantes
+    // y el pago acumulado, así que nunca debe aceptar un monto inválido, venga de donde venga.
+    if (!Number.isInteger(montoCentavos) || montoCentavos <= 0) {
+        throw Object.assign(new Error("El monto del pago debe ser mayor a 0."), { httpStatus: 400 });
+    }
+
     // Antes de cobrar, se carga cualquier recargo pendiente de esta cuota para que el saldo sea el real.
     // (El pago acumulado ya lo hizo para todo el estudiante, por eso puede omitirse con recargosAlDia.)
     if (!recargosAlDia) {
@@ -196,6 +205,9 @@ async function aplicarPago(client, obligacion_id, montoCentavos, { usuario = nul
     const pagadoC   = Math.round(parseFloat(obl.monto_pagado) * 100);
     const saldoC    = totalC - pagadoC;
 
+    if (saldoC <= 0) {
+        throw Object.assign(new Error("Esta obligación no tiene saldo pendiente."), { httpStatus: 400 });
+    }
     if (montoCentavos > saldoC) {
         throw Object.assign(
             new Error(`El monto ($${(montoCentavos / 100).toFixed(2)}) excede el saldo pendiente ($${(saldoC / 100).toFixed(2)}).`),

@@ -46,6 +46,31 @@ function aCentavos(valor, maximo = 100000) {
     return centavos;
 }
 
+/** Texto con longitud entre min y max (después de recortar espacios). */
+function textoEnRango(valor, min, max) {
+    const t = String(valor ?? "").trim();
+    return t.length >= min && t.length <= max;
+}
+
+/**
+ * Número finito dentro de un rango. Rechaza vacío, null, booleanos y texto no numérico.
+ * Opciones: { min, max, minExclusivo } (minExclusivo: true => el valor debe ser > min).
+ */
+function numeroEnRango(valor, { min = -Infinity, max = Infinity, minExclusivo = false } = {}) {
+    if (valor === null || valor === undefined || valor === "" || typeof valor === "boolean") return false;
+    const n = Number(valor);
+    if (!Number.isFinite(n)) return false;
+    if (minExclusivo ? n <= min : n < min) return false;
+    return n <= max;
+}
+
+/** Entero mayor a 0 (sirve para validar ids que llegan por body o por URL). */
+function enteroPositivo(valor) {
+    if (valor === null || valor === undefined || valor === "" || typeof valor === "boolean") return false;
+    const n = Number(valor);
+    return Number.isInteger(n) && n > 0;
+}
+
 function esHoraValida(h) {
     return /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(String(h || ""));
 }
@@ -58,6 +83,9 @@ module.exports = {
     cedulaEcuatorianaValida,
     contrasenaValida,
     aCentavos,
+    textoEnRango,
+    numeroEnRango,
+    enteroPositivo,
     esHoraValida,
     DIAS_VALIDOS
 };

@@ -1,16 +1,19 @@
 // src/controllers/asignaturasControllers.js
 const pool = require("../db");
+const { textoEnRango, enteroPositivo } = require("../utils/validaciones");
 
 const NIVELES_VALIDOS = ["Iniciación", "Profesionalización", "Especialización"];
 
 /** Valida el cuerpo de crear/editar asignatura. Devuelve mensaje de error o null. */
 async function validarAsignatura({ nombre_asignatura, titulacion_id, nivel, es_electiva }) {
-  const nombre = String(nombre_asignatura || "").trim();
-  if (nombre.length < 3 || nombre.length > 120) {
+  if (!textoEnRango(nombre_asignatura, 3, 120)) {
     return "El nombre de la asignatura debe tener entre 3 y 120 caracteres.";
   }
   if (!titulacion_id) {
     return "Selecciona la titulación a la que pertenece la asignatura.";
+  }
+  if (!enteroPositivo(titulacion_id)) {
+    return "titulacion_id inválido.";
   }
   if (!nivel) {
     return "Selecciona el nivel del pensum.";

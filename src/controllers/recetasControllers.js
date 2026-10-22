@@ -1,6 +1,11 @@
 // src/controllers/recetasControllers.js
 const pool = require("../db");
 const PDFDocument = require("pdfkit");
+const { numeroEnRango, enteroPositivo } = require("../utils/validaciones");
+
+const CANTIDAD_MAXIMA_INSUMO = 100000;
+const PRECIO_MAXIMO = 100000;
+const MAX_INGREDIENTES = 100;
 
 /* ============================================================
    Utilidad: ejecutar una función dentro de una transacción
@@ -52,13 +57,83 @@ function validarCamposReceta({ nombre, porciones, tiempo_prep_min }) {
   return null;
 }
 
+/** precio_venta_sugerido es opcional; si viene debe estar entre 0 y PRECIO_MAXIMO. */
+function validarPrecio(precio) {
+  if (precio === undefined || precio === null || precio === "") return null;
+  return numeroEnRango(precio, { min: 0, max: PRECIO_MAXIMO })
+    ? null
+    : `precio_venta_sugerido debe ser un número entre 0 y ${PRECIO_MAXIMO}.`;
+}
+
+/**
+ * Valida la lista de ingredientes: ids válidos y sin repetir, cantidad > 0
+ * (salvo "al gusto", que se guarda como 0) y que cada insumo exista.
+ * Devuelve un mensaje de error o null.
+ */
+async function validarInsumosReceta(insumos) {
+  if (insumos === undefined || insumos === null) return null;
+  if (!Array.isArray(insumos)) return "insumos debe ser una lista.";
+  if (insumos.length > MAX_INGREDIENTES) {
+    return `Una receta no puede tener más de ${MAX_INGREDIENTES} ingredientes.`;
+  }
+
+  const ids = new Set();
+  for (let i = 0; i < insumos.length; i++) {
+    const item = insumos[i];
+    const pos = `Ingrediente #${i + 1}`;
+    if (!item || !enteroPositivo(item.insumo_id)) return `${pos}: insumo_id inválido.`;
+    const id = Number(item.insumo_id);
+    if (ids.has(id)) return `${pos}: el insumo está repetido en la receta.`;
+    ids.add(id);
+    if (!item.es_al_gusto &&
+        !numeroEnRango(item.cantidad, { min: 0, max: CANTIDAD_MAXIMA_INSUMO, minExclusivo: true })) {
+      return `${pos}: la cantidad debe ser mayor a 0 (o márcalo como "al gusto").`;
+    }
+  }
+
+  if (ids.size > 0) {
+    const r = await pool.query(
+      `SELECT insumo_id FROM public.insumos_costos WHERE insumo_id = ANY($1::int[])`,
+      [[...ids]]
+    );
+    if (r.rows.length !== ids.size) return "Alguno de los insumos seleccionados no existe.";
+  }
+  return null;
+}
+
+/**
+ * Comprueba que la asignatura exista (si se indicó) y que no haya otra receta con el
+ * mismo nombre dentro de esa asignatura. Devuelve { status, error } o null si todo está bien.
+ */
+async function validarAsignaturaYDuplicado({ nombre, asignatura_id, excluirRecetaId = null }) {
+  const tieneAsignatura = asignatura_id !== undefined && asignatura_id !== null && asignatura_id !== "";
+  if (tieneAsignatura) {
+    if (!enteroPositivo(asignatura_id)) return { status: 400, error: "asignatura_id inválido." };
+    const a = await pool.query(
+      `SELECT 1 FROM public.asignaturas WHERE asignatura_id = $1`, [asignatura_id]
+    );
+    if (a.rows.length === 0) return { status: 404, error: "La asignatura seleccionada no existe." };
+  }
+
+  const dup = await pool.query(
+    `SELECT 1 FROM public.recetas
+      WHERE LOWER(TRIM(nombre)) = LOWER(TRIM($1))
+        AND asignatura_id IS NOT DISTINCT FROM $2::int
+        AND ($3::int IS NULL OR receta_id <> $3::int)`,
+    [nombre, tieneAsignatura ? Number(asignatura_id) : null, excluirRecetaId]
+  );
+  if (dup.rows.length > 0) {
+    return { status: 409, error: "Ya existe una receta con ese nombre en esa asignatura." };
+  }
+  return null;
+}
+
 /* ============================================================
    1. POST /api/recetas
    Crea la ficha maestra + su primera versión (1.0, BORRADOR)
    body: { nombre, porciones, tiempo_prep_min, asignatura_id,
            contenido_json, precio_venta_sugerido,
-           insumos: [{insumo_id, cantidad}],
-           menaje: [{articulo_id, cantidad_requerida}] }
+           insumos: [{insumo_id, cantidad}] }
    ============================================================ */
 async function crearReceta(req, res) {
   const {
@@ -69,7 +144,6 @@ async function crearReceta(req, res) {
     contenido_json,
     precio_venta_sugerido,
     insumos,
-    menaje,
   } = req.body;
 
   if (!nombre || !porciones) {
@@ -79,8 +153,21 @@ async function crearReceta(req, res) {
   if (errorCampos) {
     return res.status(400).json({ error: errorCampos });
   }
+  const errorPrecio = validarPrecio(precio_venta_sugerido);
+  if (errorPrecio) {
+    return res.status(400).json({ error: errorPrecio });
+  }
 
   try {
+    const errorInsumos = await validarInsumosReceta(insumos);
+    if (errorInsumos) {
+      return res.status(400).json({ error: errorInsumos });
+    }
+    const conflicto = await validarAsignaturaYDuplicado({ nombre, asignatura_id });
+    if (conflicto) {
+      return res.status(conflicto.status).json({ error: conflicto.error });
+    }
+
     const usuario_creador_id = req.user.id;
 
     const resultado = await conTransaccion(async (client) => {
@@ -89,7 +176,7 @@ async function crearReceta(req, res) {
             (nombre, porciones, tiempo_prep_min, asignatura_id, usuario_creador_id)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING *`,
-        [nombre, porciones, tiempo_prep_min || null, asignatura_id || null, usuario_creador_id]
+        [String(nombre).trim(), porciones, tiempo_prep_min || null, asignatura_id || null, usuario_creador_id]
       );
       const receta = recetaResult.rows[0];
 
@@ -114,16 +201,6 @@ async function crearReceta(req, res) {
             `INSERT INTO public.receta_version_insumos (version_id, insumo_id, cantidad)
              VALUES ($1, $2, $3)`,
             [version.version_id, item.insumo_id, cantidadFinal]
-          );
-        }
-      }
-
-      if (Array.isArray(menaje)) {
-        for (const item of menaje) {
-          await client.query(
-            `INSERT INTO public.receta_articulos_menaje (version_id, articulo_id, cantidad_requerida)
-             VALUES ($1, $2, $3)`,
-            [version.version_id, item.articulo_id, item.cantidad_requerida]
           );
         }
       }
@@ -185,12 +262,12 @@ async function obtenerRecetas(req, res) {
 /* ============================================================
    3. GET /api/recetas/:id
    Detalle completo: receta + todas sus versiones + insumos
-   y menaje de la última versión. Si el que consulta es
+   de la última versión. Si el que consulta es
    Estudiante (rol 3), valida que tenga acceso asignado.
    ============================================================ */
 /* ============================================================
    Helper compartido: trae el detalle completo de una receta
-   (ficha + última versión + insumos + menaje). Lo usan tanto
+   (ficha + última versión + insumos). Lo usan tanto
    obtenerRecetaPorId (JSON para la app) como exportarRecetaPdf
    (ficha técnica en PDF) para no duplicar las mismas 4 consultas.
    ============================================================ */
@@ -232,7 +309,6 @@ async function obtenerDetalleRecetaCompleto(id) {
   const ultimaVersion = versiones[0] || null;
 
   let insumos = [];
-  let menaje = [];
 
   if (ultimaVersion) {
     const insumosResult = await pool.query(
@@ -245,18 +321,9 @@ async function obtenerDetalleRecetaCompleto(id) {
       [ultimaVersion.version_id]
     );
     insumos = insumosResult.rows;
-
-    const menajeResult = await pool.query(
-      `SELECT ram.articulo_id, ia.nombre, ia.tipo, ram.cantidad_requerida
-       FROM public.receta_articulos_menaje ram
-       JOIN public.inventario_articulos ia ON ram.articulo_id = ia.articulo_id
-       WHERE ram.version_id = $1`,
-      [ultimaVersion.version_id]
-    );
-    menaje = menajeResult.rows;
   }
 
-  return { receta, versiones, ultimaVersion, insumos, menaje };
+  return { receta, versiones, ultimaVersion, insumos };
 }
 
 async function obtenerRecetaPorId(req, res) {
@@ -283,8 +350,7 @@ async function obtenerRecetaPorId(req, res) {
       receta: detalle.receta,
       versiones: detalle.versiones,
       ultima_version: detalle.ultimaVersion,
-      insumos: detalle.insumos,
-      menaje: detalle.menaje
+      insumos: detalle.insumos
     });
   } catch (error) {
     console.error("🔴 Error al obtener receta:", error);
@@ -300,6 +366,9 @@ async function actualizarReceta(req, res) {
   const { id } = req.params;
   const { nombre, porciones, tiempo_prep_min, asignatura_id } = req.body;
 
+  if (!enteroPositivo(id)) {
+    return res.status(400).json({ error: "id de receta inválido." });
+  }
   const errorCampos = validarCamposReceta({ nombre, porciones, tiempo_prep_min });
   if (errorCampos) {
     return res.status(400).json({ error: errorCampos });
@@ -309,6 +378,13 @@ async function actualizarReceta(req, res) {
     const propiedad = await verificarPropiedadReceta(req, id);
     if (!propiedad.ok) return res.status(propiedad.status).json({ error: propiedad.error });
 
+    const conflicto = await validarAsignaturaYDuplicado({
+      nombre, asignatura_id, excluirRecetaId: Number(id)
+    });
+    if (conflicto) {
+      return res.status(conflicto.status).json({ error: conflicto.error });
+    }
+
     const result = await pool.query(
       `UPDATE public.recetas
        SET nombre = $1,
@@ -317,7 +393,7 @@ async function actualizarReceta(req, res) {
            asignatura_id = $4
        WHERE receta_id = $5
        RETURNING *`,
-      [nombre, porciones, tiempo_prep_min || null, asignatura_id || null, id]
+      [String(nombre).trim(), porciones, tiempo_prep_min || null, asignatura_id || null, id]
     );
 
     if (result.rows.length === 0) {
@@ -354,6 +430,9 @@ async function eliminarReceta(req, res) {
           `DELETE FROM public.receta_version_insumos WHERE version_id = ANY($1)`,
           [versionIds]
         );
+        // Limpieza de datos antiguos: la FK de receta_articulos_menaje es NO ACTION (sin cascada),
+        // así que si una versión aún tiene filas de menaje, borrar la versión fallaría.
+        // El menaje ya no se crea ni se muestra; la tabla no se modifica.
         await client.query(
           `DELETE FROM public.receta_articulos_menaje WHERE version_id = ANY($1)`,
           [versionIds]
@@ -390,15 +469,30 @@ async function eliminarReceta(req, res) {
    ============================================================ */
 async function crearVersion(req, res) {
   const { id } = req.params;
-  const { numero_version, contenido_json, precio_venta_sugerido, insumos, menaje } = req.body;
+  const { numero_version, contenido_json, precio_venta_sugerido, insumos } = req.body;
 
+  if (!enteroPositivo(id)) {
+    return res.status(400).json({ error: "id de receta inválido." });
+  }
   if (!numero_version) {
     return res.status(400).json({ error: "numero_version es obligatorio (ej: '1.1')." });
+  }
+  if (!/^\d{1,3}(\.\d{1,3})?$/.test(String(numero_version).trim())) {
+    return res.status(400).json({ error: "numero_version debe tener formato numérico, por ejemplo '1.1'." });
+  }
+  const errorPrecio = validarPrecio(precio_venta_sugerido);
+  if (errorPrecio) {
+    return res.status(400).json({ error: errorPrecio });
   }
 
   try {
     const propiedad = await verificarPropiedadReceta(req, id);
     if (!propiedad.ok) return res.status(propiedad.status).json({ error: propiedad.error });
+
+    const errorInsumos = await validarInsumosReceta(insumos);
+    if (errorInsumos) {
+      return res.status(400).json({ error: errorInsumos });
+    }
 
     const resultado = await conTransaccion(async (client) => {
       const versionResult = await client.query(
@@ -422,16 +516,6 @@ async function crearVersion(req, res) {
             `INSERT INTO public.receta_version_insumos (version_id, insumo_id, cantidad)
              VALUES ($1, $2, $3)`,
             [version.version_id, item.insumo_id, cantidadFinal]
-          );
-        }
-      }
-
-      if (Array.isArray(menaje)) {
-        for (const item of menaje) {
-          await client.query(
-            `INSERT INTO public.receta_articulos_menaje (version_id, articulo_id, cantidad_requerida)
-             VALUES ($1, $2, $3)`,
-            [version.version_id, item.articulo_id, item.cantidad_requerida]
           );
         }
       }
@@ -652,7 +736,7 @@ async function exportarRecetaPdf(req, res) {
     if (!detalle) {
       return res.status(404).json({ error: "Receta no encontrada." });
     }
-    const { receta, ultimaVersion, insumos, menaje } = detalle;
+    const { receta, ultimaVersion, insumos } = detalle;
     const pasos = ultimaVersion?.contenido_json?.pasos || [];
 
     const doc = new PDFDocument({ margin: 45, size: "A4" });
@@ -699,17 +783,6 @@ async function exportarRecetaPdf(req, res) {
       doc.fillColor("#999999").text("Esta receta aún no tiene ingredientes registrados.");
     }
     doc.moveDown(1);
-
-    // ── Menaje / utensilios (solo si aplica) ────────────────
-    if (menaje.length > 0) {
-      doc.fillColor("#1a1a1a").font("Helvetica-Bold").fontSize(12).text("Menaje y Utensilios");
-      doc.moveDown(0.3);
-      doc.font("Helvetica").fontSize(9.5);
-      menaje.forEach((m) => {
-        doc.fillColor("#1a1a1a").text(`•  ${m.cantidad_requerida} x ${m.nombre}`);
-      });
-      doc.moveDown(1);
-    }
 
     // ── Pasos de preparación ────────────────────────────────
     doc.fillColor("#1a1a1a").font("Helvetica-Bold").fontSize(12).text("Pasos de Preparación");
