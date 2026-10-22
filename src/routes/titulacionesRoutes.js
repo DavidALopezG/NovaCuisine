@@ -1,6 +1,8 @@
 // src/routes/titulacionesRoutes.js
 const express = require("express");
 const router = express.Router();
+const { validarIdParam } = require("../utils/validaciones");
+router.param("id", validarIdParam);
 const titulacionesController = require("../controllers/titulacionesControllers");
 const { verifyToken, authorizeRoles } = require("../middleware/authMiddleware");
 

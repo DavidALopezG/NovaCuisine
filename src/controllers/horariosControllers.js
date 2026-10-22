@@ -95,7 +95,11 @@ async function crearHorario(req, res) {
     modalidad = modalidad || "Presencial";
 
     // Si quien crea es Docente (rol 2) y no especifica otro docente, se asigna a sí mismo
-    if (req.user.rol === 2 && !docente_id) {
+    if (req.user.rol === 2) {
+        // Un Docente solo crea bloques a su nombre (igual que en la edición, donde no puede reasignarlos)
+        if (docente_id && String(docente_id) !== String(req.user.id)) {
+            return res.status(403).json({ error: "Un docente solo puede crear horarios asignados a sí mismo." });
+        }
         docente_id = req.user.id;
     }
 

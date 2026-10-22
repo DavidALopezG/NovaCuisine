@@ -271,7 +271,7 @@ async function obtenerRecetas(req, res) {
    obtenerRecetaPorId (JSON para la app) como exportarRecetaPdf
    (ficha técnica en PDF) para no duplicar las mismas 4 consultas.
    ============================================================ */
-async function obtenerDetalleRecetaCompleto(id) {
+async function obtenerDetalleRecetaCompleto(id, { soloAprobadas = false } = {}) {
   const recetaResult = await pool.query(
     `SELECT r.*, a.nombre_asignatura, a.titulacion_id
      FROM public.recetas r
@@ -287,7 +287,7 @@ async function obtenerDetalleRecetaCompleto(id) {
 
   const versionesResult = await pool.query(
     `SELECT * FROM public.recetas_versiones
-     WHERE receta_id = $1
+     WHERE receta_id = $1 ${soloAprobadas ? "AND estado = 'APROBADA'" : ""}
      ORDER BY version_id DESC`,
     [id]
   );
@@ -341,9 +341,13 @@ async function obtenerRecetaPorId(req, res) {
       }
     }
 
-    const detalle = await obtenerDetalleRecetaCompleto(id);
+    // El estudiante solo ve versiones APROBADAS (nunca borradores del docente)
+    const detalle = await obtenerDetalleRecetaCompleto(id, { soloAprobadas: req.user.rol === 3 });
     if (!detalle) {
       return res.status(404).json({ error: "Receta no encontrada." });
+    }
+    if (req.user.rol === 3 && !detalle.ultimaVersion) {
+      return res.status(404).json({ error: "Esta receta aún no tiene una versión aprobada." });
     }
 
     res.json({
@@ -732,9 +736,13 @@ async function exportarRecetaPdf(req, res) {
       }
     }
 
-    const detalle = await obtenerDetalleRecetaCompleto(id);
+    // El estudiante solo ve versiones APROBADAS (nunca borradores del docente)
+    const detalle = await obtenerDetalleRecetaCompleto(id, { soloAprobadas: req.user.rol === 3 });
     if (!detalle) {
       return res.status(404).json({ error: "Receta no encontrada." });
+    }
+    if (req.user.rol === 3 && !detalle.ultimaVersion) {
+      return res.status(404).json({ error: "Esta receta aún no tiene una versión aprobada." });
     }
     const { receta, ultimaVersion, insumos } = detalle;
     const pasos = ultimaVersion?.contenido_json?.pasos || [];

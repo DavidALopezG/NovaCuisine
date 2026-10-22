@@ -1,6 +1,8 @@
 // src/routes/asignaturasRoutes.js
 const express = require("express");
 const router = express.Router();
+const { validarIdParam } = require("../utils/validaciones");
+router.param("id", validarIdParam);
 const asignaturasController = require("../controllers/asignaturasControllers");
 const { verifyToken, authorizeRoles } = require("../middleware/authMiddleware");
 

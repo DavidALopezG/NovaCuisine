@@ -22,7 +22,7 @@ const dinero = (centavos) => (centavos / 100).toFixed(2);
 
 /** Valida 'YYYY-MM-DD' (fecha real, sin desfases de zona horaria) y un rango razonable. */
 function parseFechaISO(valor) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(valor || ""));
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:$|[T ])/.exec(String(valor || "")); // anclada: rechaza "2026-10-19basura"
     if (!m) return null;
     const [_, y, mo, d] = m;
     const fecha = new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d)));

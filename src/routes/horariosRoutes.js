@@ -1,6 +1,8 @@
 // src/routes/horariosRoutes.js
 const express = require("express");
 const router = express.Router();
+const { validarIdParam } = require("../utils/validaciones");
+router.param("id", validarIdParam);
 const horariosController = require("../controllers/horariosControllers");
 const { verifyToken, authorizeRoles } = require("../middleware/authMiddleware");
 

@@ -37,8 +37,17 @@ function contrasenaValida(pwd) {
     return p.length >= 8 && p.length <= 72 && /[A-Za-z]/.test(p) && /\d/.test(p);
 }
 
-/** Convierte a centavos (entero) o devuelve null si no es un monto válido (> 0, máx. 2 decimales). */
+/**
+ * Convierte a centavos (entero) o devuelve null si no es un monto válido (> 0, máx. 2 decimales).
+ * Solo acepta number o string decimal simple ("12", "12.5", "12.50"): se rechazan booleanos,
+ * arreglos, notación científica ("1e2") y espacios, que Number() convertiría sin error.
+ */
 function aCentavos(valor, maximo = 100000) {
+    if (typeof valor === "string") {
+        if (!/^\d+(\.\d{1,2})?$/.test(valor.trim())) return null;
+    } else if (typeof valor !== "number") {
+        return null;
+    }
     const n = Number(valor);
     if (!Number.isFinite(n) || n <= 0 || n > maximo) return null;
     const centavos = Math.round(n * 100);
@@ -75,6 +84,40 @@ function esHoraValida(h) {
     return /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(String(h || ""));
 }
 
+
+/** Fecha local de hoy en formato YYYY-MM-DD (sin pasar por UTC). */
+function hoyISO() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Normaliza una fecha a "YYYY-MM-DD" REAL (rechaza 2026-02-31) sin desfases de zona horaria.
+ * Acepta "YYYY-MM-DD" (con o sin hora) y objetos Date (p. ej. celdas de Excel, tomadas en hora local).
+ */
+function fechaISOValida(valor) {
+    let y, m, d;
+    if (valor instanceof Date) {
+        if (Number.isNaN(valor.getTime())) return null;
+        y = valor.getFullYear(); m = valor.getMonth() + 1; d = valor.getDate();
+    } else {
+        const x = /^(\d{4})-(\d{2})-(\d{2})(?:$|[T ])/.exec(String(valor ?? "").trim());
+        if (!x) return null;
+        y = Number(x[1]); m = Number(x[2]); d = Number(x[3]);
+    }
+    const t = new Date(Date.UTC(y, m - 1, d));
+    if (t.getUTCFullYear() !== y || t.getUTCMonth() !== m - 1 || t.getUTCDate() !== d) return null;
+    return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+/** Middleware para router.param: el id de la ruta debe ser un entero positivo (si no, 400 en vez de 500). */
+function validarIdParam(req, res, next, valor) {
+    if (!/^\d{1,9}$/.test(String(valor)) || Number(valor) < 1) {
+        return res.status(400).json({ error: "El identificador de la ruta no es válido." });
+    }
+    next();
+}
+
 const DIAS_VALIDOS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
 
 module.exports = {
@@ -86,6 +129,9 @@ module.exports = {
     textoEnRango,
     numeroEnRango,
     enteroPositivo,
+    hoyISO,
+    fechaISOValida,
+    validarIdParam,
     esHoraValida,
     DIAS_VALIDOS
 };

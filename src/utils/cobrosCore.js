@@ -114,6 +114,9 @@ async function aplicarRecargos(client = pool, { estudianteId = null, obligacionI
                 monto_base              = f.monto_base
            FROM final f
           WHERE co.obligacion_id = f.obligacion_id
+            -- En READ COMMITTED, si otra transacción cargó el recargo mientras esperábamos el bloqueo de
+            -- la fila, esta condición se vuelve a evaluar y evita cobrar el mismo mes dos veces.
+            AND co.recargo_meses_aplicados < f.meses_vencidos
           RETURNING co.obligacion_id, f.incremento`,
         [hoy, estudianteId === null ? null : String(estudianteId), obligacionId]
     );

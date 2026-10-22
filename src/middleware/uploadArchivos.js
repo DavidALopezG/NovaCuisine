@@ -6,8 +6,16 @@
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 
 const BASE_UPLOADS_DIR = path.join(__dirname, "..", "..", "uploads");
+
+// La extensión se deriva del tipo MIME permitido, NO del nombre original (que controla el cliente):
+// antes un "recibo.html" declarado como image/png se guardaba como .html y se servía como página.
+const EXT_POR_MIME = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/webp": ".webp", "application/pdf": ".pdf"
+};
 
 function crearStorage(subcarpeta) {
     const destino = path.join(BASE_UPLOADS_DIR, subcarpeta);
@@ -17,8 +25,8 @@ function crearStorage(subcarpeta) {
     return multer.diskStorage({
         destination: (req, file, cb) => cb(null, destino),
         filename: (req, file, cb) => {
-            const ext = path.extname(file.originalname).toLowerCase();
-            const nombreUnico = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+            const ext = EXT_POR_MIME[file.mimetype] || "";
+            const nombreUnico = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
             cb(null, nombreUnico);
         }
     });

@@ -1,33 +1,26 @@
 // src/controllers/cobrosControllers.js
 const pool = require("../db");
 const XLSX = require("xlsx");
-const { aCentavos, enteroPositivo } = require("../utils/validaciones");
+const { aCentavos, enteroPositivo, fechaISOValida, hoyISO } = require("../utils/validaciones");
 const { aplicarRecargos, aplicarRecargosSiToca, estadoRealSql } = require("../utils/cobrosCore");
 
 // Tope razonable de una obligación individual (USD). Evita montos absurdos por error de digitación.
 const MONTO_MAXIMO_OBLIGACION = 10000;
 const MAX_FILAS_EXCEL = 500;
 
-// Fecha de vencimiento por defecto: 3 meses a partir de hoy
+// Fecha de vencimiento por defecto: 3 meses a partir de hoy, como "YYYY-MM-DD" local.
 const calcularFechaVencimiento = () => {
     const d = new Date();
     d.setMonth(d.getMonth() + 3);
-    return d;
+    return fechaISOValida(d);
 };
 
-/** Convierte a Date válida o devuelve null. Acepta Date, ISO "YYYY-MM-DD" y fechas de Excel. */
-function parsearFecha(valor) {
-    if (valor === null || valor === undefined || valor === "") return null;
-    const d = valor instanceof Date ? valor : new Date(valor);
-    return Number.isNaN(d.getTime()) ? null : d;
-}
-
-/** Inicio del día de hoy (para comparar fechas de vencimiento sin la hora). */
-function inicioDeHoy() {
-    const h = new Date();
-    h.setHours(0, 0, 0, 0);
-    return h;
-}
+/**
+ * Las fechas de vencimiento se manejan SIEMPRE como texto "YYYY-MM-DD" (hora local).
+ * Antes se usaba new Date("2026-10-21"), que es medianoche UTC = 19:00 del día anterior en Ecuador:
+ * el vencimiento se guardaba un día antes y "hoy" se rechazaba como "anterior a hoy".
+ */
+const parsearFecha = (valor) => (valor === null || valor === undefined || valor === "" ? null : fechaISOValida(valor));
 
 /* ═══════════════════════════════════════════════════════════
    1. POST /api/cobros/obligaciones  (Admin)
@@ -36,7 +29,7 @@ async function crearObligacion(req, res) {
     const { estudiante_id, monto_total, fecha_vencimiento } = req.body;
     const concepto = req.body.concepto ? String(req.body.concepto).trim().slice(0, 120) : null;
 
-    if (!estudiante_id || !monto_total) {
+    if (!estudiante_id || monto_total === undefined || monto_total === null || monto_total === "") {
         return res.status(400).json({ error: "estudiante_id y monto_total son obligatorios." });
     }
 
@@ -53,7 +46,7 @@ async function crearObligacion(req, res) {
         if (!fecha) {
             return res.status(400).json({ error: "fecha_vencimiento no es una fecha válida." });
         }
-        if (fecha < inicioDeHoy()) {
+        if (fecha < hoyISO()) {
             return res.status(400).json({ error: "La fecha de vencimiento no puede ser anterior a hoy." });
         }
     }
@@ -129,8 +122,8 @@ async function registrarPago(req, res) {
     const { obligacion_id, monto_pago, metodo_pago } = req.body;
 
     const centavos = aCentavos(monto_pago, MONTO_MAXIMO_OBLIGACION);
-    if (!obligacion_id) {
-        return res.status(400).json({ error: "obligacion_id es obligatorio." });
+    if (!/^\d{1,9}$/.test(String(obligacion_id ?? ""))) {
+        return res.status(400).json({ error: "obligacion_id es obligatorio y debe ser numérico." });
     }
     if (!enteroPositivo(obligacion_id)) {
         return res.status(400).json({ error: "obligacion_id inválido." });
@@ -288,7 +281,7 @@ async function importarObligacionesExcel(req, res) {
 
     try {
         await client.query("BEGIN");
-        const hoy = inicioDeHoy();
+        const hoy = hoyISO();
 
         for (let i = 0; i < filas.length; i++) {
             const fila       = filas[i];
@@ -406,6 +399,7 @@ async function obtenerMisObligaciones(req, res) {
                 monto_pagado,
                 (monto_total - monto_pagado) AS saldo_pendiente,
                 estado,
+                ${estadoRealSql("cobros_obligaciones")} AS estado_real,
                 fecha_pago,
                 comprobante_ruta,
                 comprobante_monto_declarado,
@@ -435,12 +429,15 @@ async function subirComprobante(req, res) {
     const { id } = req.params;
     const { monto_declarado } = req.body;
 
+    // multer ya guardó el archivo en disco antes de llegar aquí: si se rechaza la petición hay que borrarlo
+    const descartarArchivo = () => { if (req.file) require("fs").unlink(req.file.path, () => {}); };
+
     if (!req.file) {
-        return res.status(400).json({ error: "Debes adjuntar el comprobante (imagen o PDF)." });
+        return (descartarArchivo(), res.status(400)).json({ error: "Debes adjuntar el comprobante (imagen o PDF)." });
     }
     const declaradoC = aCentavos(monto_declarado, MONTO_MAXIMO_OBLIGACION);
     if (declaradoC === null) {
-        return res.status(400).json({ error: "monto_declarado debe ser mayor a 0 y tener máximo 2 decimales." });
+        return (descartarArchivo(), res.status(400)).json({ error: "monto_declarado debe ser mayor a 0 y tener máximo 2 decimales." });
     }
 
     try {
@@ -451,22 +448,22 @@ async function subirComprobante(req, res) {
             [id]
         );
         if (obligacion.rows.length === 0) {
-            return res.status(404).json({ error: "Obligación no encontrada." });
+            return (descartarArchivo(), res.status(404)).json({ error: "Obligación no encontrada." });
         }
         if (Number(obligacion.rows[0].estudiante_id) !== Number(req.user.id)) {
-            return res.status(403).json({ error: "No puedes subir un comprobante para una obligación que no es tuya." });
+            return (descartarArchivo(), res.status(403)).json({ error: "No puedes subir un comprobante para una obligación que no es tuya." });
         }
         if (obligacion.rows[0].estado === "PAGADO") {
-            return res.status(400).json({ error: "Esta obligación ya está completamente pagada." });
+            return (descartarArchivo(), res.status(400)).json({ error: "Esta obligación ya está completamente pagada." });
         }
         // No sobrescribir un comprobante que el admin todavía no revisó (se perdería el anterior)
         if (obligacion.rows[0].comprobante_estado === "PENDIENTE") {
-            return res.status(409).json({ error: "Ya tienes un comprobante en revisión para esta obligación. Espera la respuesta del administrador." });
+            return (descartarArchivo(), res.status(409)).json({ error: "Ya tienes un comprobante en revisión para esta obligación. Espera la respuesta del administrador." });
         }
         const saldoC = Math.round(parseFloat(obligacion.rows[0].monto_total) * 100)
                      - Math.round(parseFloat(obligacion.rows[0].monto_pagado) * 100);
         if (declaradoC > saldoC) {
-            return res.status(400).json({
+            return (descartarArchivo(), res.status(400)).json({
                 error: `El monto declarado ($${(declaradoC / 100).toFixed(2)}) supera tu saldo pendiente ($${(saldoC / 100).toFixed(2)}).`
             });
         }
@@ -489,6 +486,7 @@ async function subirComprobante(req, res) {
             obligacion: result.rows[0]
         });
     } catch (error) {
+        descartarArchivo();
         console.error("🔴 subirComprobante:", error);
         res.status(500).json({ error: "Error interno al subir el comprobante." });
     }
@@ -521,7 +519,7 @@ async function aprobarComprobante(req, res) {
             return res.status(400).json({ error: "Esta obligación no tiene un comprobante pendiente de revisión." });
         }
 
-        const montoAplicar = obligacion.rows[0].comprobante_monto_declarado;
+        const montoAplicar = Number(obligacion.rows[0].comprobante_monto_declarado);
         const centavos = aCentavos(montoAplicar, MONTO_MAXIMO_OBLIGACION);
         if (centavos === null) {
             await client.query("ROLLBACK");

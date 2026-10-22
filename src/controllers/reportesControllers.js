@@ -2,6 +2,7 @@
 const pool = require("../db");
 const XLSX = require("xlsx");
 const PDFDocument = require("pdfkit");
+const { fechaISOValida } = require("../utils/validaciones");
 
 // Expresión SQL reutilizable: calcula el estado real de una obligación
 // (PAGADO / VENCIDO / PARCIAL / PENDIENTE), igual que se calcula en el
@@ -22,10 +23,20 @@ const ESTADO_REAL_SQL = `
  * Todas las consultas de este controller hacen JOIN con estudiantes (y
  * opcionalmente titulaciones), así que este helper asume alias co / e.
  */
+const ESTADOS_REPORTE = ["PAGADO", "VENCIDO", "PARCIAL", "PENDIENTE"];
+
 function construirFiltros(query) {
   const { fecha_inicio, fecha_fin, titulacion_id, estado } = query;
   const condiciones = [];
   const params = [];
+
+  // Validación de filtros: un valor mal formado debe dar 400, no un error 500 de la base de datos
+  const error = (mensaje) => Object.assign(new Error(mensaje), { httpStatus: 400 });
+  if (fecha_inicio && !fechaISOValida(fecha_inicio)) throw error("fecha_inicio no es una fecha válida (AAAA-MM-DD).");
+  if (fecha_fin && !fechaISOValida(fecha_fin)) throw error("fecha_fin no es una fecha válida (AAAA-MM-DD).");
+  if (fecha_inicio && fecha_fin && fecha_inicio > fecha_fin) throw error("fecha_inicio no puede ser posterior a fecha_fin.");
+  if (titulacion_id && !/^\d{1,9}$/.test(String(titulacion_id))) throw error("titulacion_id inválido.");
+  if (estado && !ESTADOS_REPORTE.includes(String(estado).toUpperCase())) throw error(`estado debe ser uno de: ${ESTADOS_REPORTE.join(", ")}.`);
 
   if (fecha_inicio) {
     params.push(fecha_inicio);
@@ -74,6 +85,7 @@ async function obtenerResumen(req, res) {
 
     res.json(result.rows[0]);
   } catch (error) {
+    if (error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
     console.error("🔴 obtenerResumen (reportes):", error);
     res.status(500).json({ error: "Error al calcular el resumen del reporte." });
   }
@@ -102,6 +114,7 @@ async function obtenerSerieMensual(req, res) {
 
     res.json(result.rows);
   } catch (error) {
+    if (error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
     console.error("🔴 obtenerSerieMensual:", error);
     res.status(500).json({ error: "Error al calcular la serie mensual." });
   }
@@ -131,6 +144,7 @@ async function obtenerPorTitulacion(req, res) {
 
     res.json(result.rows);
   } catch (error) {
+    if (error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
     console.error("🔴 obtenerPorTitulacion:", error);
     res.status(500).json({ error: "Error al calcular el reporte por titulación." });
   }
@@ -159,6 +173,7 @@ async function obtenerPorEstado(req, res) {
 
     res.json(result.rows);
   } catch (error) {
+    if (error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
     console.error("🔴 obtenerPorEstado:", error);
     res.status(500).json({ error: "Error al calcular la distribución por estado." });
   }
@@ -218,6 +233,7 @@ async function obtenerObligacionesFiltradas(req, res) {
       totalPaginas: Math.max(Math.ceil(total / limit), 1)
     });
   } catch (error) {
+    if (error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
     console.error("🔴 obtenerObligacionesFiltradas:", error);
     res.status(500).json({ error: "Error al obtener las obligaciones filtradas." });
   }
@@ -326,6 +342,7 @@ async function exportarExcel(req, res) {
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.send(buffer);
   } catch (error) {
+    if (error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
     console.error("🔴 exportarExcel:", error);
     res.status(500).json({ error: "Error al generar el archivo Excel." });
   }
@@ -448,6 +465,7 @@ async function exportarPdf(req, res) {
 
     doc.end();
   } catch (error) {
+    if (error.httpStatus && !res.headersSent) return res.status(error.httpStatus).json({ error: error.message });
     console.error("🔴 exportarPdf:", error);
     // Si ya se empezó a escribir el PDF en la respuesta no se puede mandar JSON,
     // así que solo se responde con error si la exportación falló antes de doc.pipe(res).

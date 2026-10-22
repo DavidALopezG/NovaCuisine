@@ -169,6 +169,11 @@ async function actualizarEstudiante(req, res) {
         }
     }
 
+    const codigoFinal = String(codigo_estudiante ?? "").trim();
+    if (codigoFinal.length < 3 || codigoFinal.length > 20) {
+        return res.status(400).json({ error: "El código de estudiante debe tener entre 3 y 20 caracteres." });
+    }
+
     try {
         const errorDatos = await validarDatosEstudiante({ email, cedula, titulacion_id, nombre, apellido });
         if (errorDatos) {
@@ -186,7 +191,7 @@ async function actualizarEstudiante(req, res) {
                  fecha_nacimiento = COALESCE($7, fecha_nacimiento)
              WHERE estudiante_id = $8
              RETURNING *`,
-            [codigo_estudiante, nombre, apellido, email, titulacion_id, cedula || null, fecha_nacimiento || null, id]
+            [codigoFinal, String(nombre).trim(), String(apellido).trim(), email, titulacion_id, cedula || null, fecha_nacimiento || null, id]
         );
 
         if (result.rows.length === 0)
@@ -198,8 +203,12 @@ async function actualizarEstudiante(req, res) {
         });
 
     } catch (error) {
-        if (error.code === "23505" && error.detail?.toLowerCase().includes("cedula")) {
-            return res.status(409).json({ error: "Ya existe otro estudiante con esa cédula." });
+        if (error.code === "23505") {
+            const d = (error.detail || "").toLowerCase();
+            if (d.includes("cedula")) return res.status(409).json({ error: "Ya existe otro estudiante con esa cédula." });
+            if (d.includes("email")) return res.status(409).json({ error: "Ya existe otro estudiante con ese correo electrónico." });
+            if (d.includes("codigo")) return res.status(409).json({ error: "Ya existe otro estudiante con ese código." });
+            return res.status(409).json({ error: "Ya existe otro estudiante con esos datos." });
         }
         console.error("🔴 Error al actualizar estudiante:", error);
         res.status(500).json({ error: "Error interno al actualizar estudiante." });
@@ -222,6 +231,7 @@ async function subirFotoEstudiante(req, res) {
         );
 
         if (result.rows.length === 0) {
+            require("fs").unlink(req.file.path, () => {}); // el archivo ya se había guardado en disco
             return res.status(404).json({ error: "Estudiante no encontrado." });
         }
 

@@ -1,6 +1,9 @@
 // src/routes/recetasRoutes.js
 const express = require("express");
 const router = express.Router();
+const { validarIdParam } = require("../utils/validaciones");
+router.param("id", validarIdParam);
+router.param("version_id", validarIdParam);
 const c = require("../controllers/recetasControllers");
 const { verifyToken, authorizeRoles } = require("../middleware/authMiddleware");
 

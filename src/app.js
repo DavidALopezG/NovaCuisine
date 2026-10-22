@@ -14,7 +14,13 @@ app.use(cors());
 // (diskStorage en src/middleware/uploadArchivos.js). Requiere sesión iniciada
 // en el frontend para llegar a esta URL, pero el archivo en sí no exige token
 // porque <img>/<a> del navegador no pueden enviar Authorization header.
-app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
+app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
+  setHeaders: (res) => {
+    // Archivos subidos por usuarios: nunca deben interpretarse como página ni ejecutar scripts
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox");
+  }
+}));
 
 // Rutas organizadas
 app.use("/api/auth", authRoutes);
@@ -28,9 +34,12 @@ app.use("/api/horarios", require("./routes/horariosRoutes"));
 app.use("/api/titulaciones", require("./routes/titulacionesRoutes"));
 app.use("/api/reportes", require("./routes/reportesRoutes"));
 
-app.get("/api/admin", verifyToken, authorizeRoles("Admininstrador"), (req, res) => {
+app.get("/api/admin", verifyToken, authorizeRoles(1), (req, res) => {
   res.json({ message: "Bienvenido, Admin!" });
 });
+
+// Rutas inexistentes: JSON (antes Express devolvía una página HTML "Cannot GET ...")
+app.use((req, res) => res.status(404).json({ error: "Ruta no encontrada." }));
 
 // Manejador de errores centralizado — sin esto, un error de multer (archivo muy
 // grande o de tipo no permitido) o cualquier excepción no controlada devolvía
